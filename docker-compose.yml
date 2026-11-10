@@ -17,6 +17,19 @@ services:
       LOCAL_BASE_URL: ${LOCAL_BASE_URL:-http://gg-studio:3000}
     volumes:
       - gg-data:/app/data
+    networks:
+      default:
+      # Mạng dùng chung với các stack khác trên cùng máy (vd Logis): bên đó gọi http://gg-studio:3000/v1
+      shared:
+        aliases:
+          - gg-studio
 
 volumes:
   gg-data:
+
+networks:
+  # Phải có sẵn trước khi deploy: chạy `docker network create proxy_net` một lần trên máy.
+  # external nên deploy/down không bao giờ xoá nó. Đổi tên qua SHARED_NETWORK nếu cần.
+  shared:
+    name: ${SHARED_NETWORK:-proxy_net}
+    external: true

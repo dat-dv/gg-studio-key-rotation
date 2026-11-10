@@ -92,6 +92,7 @@ docker compose up -d --build
 
 - Từ ngoài vào: `http://<ip-server>:4041/`
 - Service cùng docker network: `http://gg-studio:3000`
+- Stack khác trên cùng máy (ví dụ Logis): gateway tham gia network dùng chung `proxy_net` với tên `gg-studio`, nên stack nào cũng gắn vào `proxy_net` gọi được `http://gg-studio:3000/v1` mà không đi vòng ra internet. Network này phải có trước khi deploy, tạo một lần bằng `docker network create proxy_net`. Lưu ý `0.0.0.0` chỉ là địa chỉ lắng nghe, container khác không gọi tới nó được.
 - Dữ liệu nằm trong volume `gg-data`. `docker compose down` giữ dữ liệu; `docker compose down -v` **xoá** dữ liệu.
 
 ### Coolify
