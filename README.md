@@ -118,6 +118,8 @@ Copy nguyên bảng Rate limits trên AI Studio, paste vào ô import. Chỉ nh�
 
 Nhập tên, tick các model được phép (không tick = mọi model), bấm tạo. Key chỉ hiện một lần. Kèm theo là lệnh curl mẫu, chọn được gọi qua **Domain** (từ ngoài vào) hay **Local** (service cùng docker network hoặc cùng máy) và theo chuẩn OpenAI hay Gemini. Địa chỉ mặc định lấy từ `PUBLIC_BASE_URL` / `LOCAL_BASE_URL`, sửa được ngay trên UI; bấm vào **key** ở mỗi dòng để mở thông tin của key (trạng thái, model được phép, lượng dùng hôm nay) kèm lệnh mẫu đúng endpoint cho từng loại model.
 
+**Gateway tự chọn model.** Với client key có tick model, bên gọi không cần biết tên model thật: gửi một tên không có trong bảng limits (ví dụ `auto`, hoặc tên của key) thì gateway thử lần lượt các model của key theo thứ tự trong bảng, model nào hết quota trên mọi key Google (hoặc Google báo không tồn tại) thì sang model kế. Chỉ model hợp với endpoint mới được xét: chat completions không chọn model embedding hay TTS. Header `x-gg-model` trong response cho biết model đã dùng. Nếu bên gọi gửi đúng tên một model có trong bảng thì gateway dùng đúng model đó, không tự đổi. Key không tick model nào thì bắt buộc phải gửi tên model thật.
+
 ### 4. Gọi API
 
 Chuẩn OpenAI:
