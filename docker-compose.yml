@@ -1,0 +1,19 @@
+services:
+  gg-studio:
+    build: .
+    image: gg-studio:latest
+    restart: unless-stopped
+    ports:
+      # cổng bên ngoài lấy từ .env (HOST_PORT, mặc định 4041); bên trong container luôn là 3000.
+      # Service khác cùng docker network gọi http://gg-studio:3000
+      - "${BIND_ADDR:-0.0.0.0}:${HOST_PORT:-4041}:3000"
+    environment:
+      # BẮT BUỘC đặt khi chạy trong mạng nội bộ: key lưu plaintext, UI có nút hiện key
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+      PROXY_TOKEN: ${PROXY_TOKEN:?set PROXY_TOKEN in .env}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-4}
+    volumes:
+      - gg-data:/app/data
+
+volumes:
+  gg-data:
