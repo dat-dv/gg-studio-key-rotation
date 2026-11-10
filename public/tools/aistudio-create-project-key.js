@@ -60,11 +60,54 @@
     return origExec(cmd, ...args);
   };
 
+  const closeBtn = () =>
+    [...document.querySelectorAll('button[aria-label="close"], button[aria-label="Close dialog"]')].find(visible);
+  const viewKeysBtn = (name) => projectRow(name)?.querySelector('button[aria-label="View API keys"]');
+  /**
+   * Tạo key cho project đã có trong bảng, giữ tên key mặc định. Dialog "Create a new key" có thể tự mở
+   * sau khi tạo project, hoặc phải bấm "Create API key" trên dòng của project; bấm mà chưa ăn thì bấm lại.
+   */
+  const ensureKey = async (name, timeout = 150000) => {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      if (visible(viewKeysBtn(name))) return;
+      const dialog = document.querySelector('mat-dialog-container');
+      const create = dialog && [...dialog.querySelectorAll('button')].find(
+        (b) => visible(b) && b.innerText.replace(/\s+/g, ' ').trim() === 'Create key'
+      );
+      if (create) {
+        // ô Project hiện "Loading..." một lúc sau khi dialog mở; bấm Create key lúc đó sẽ không ăn
+        const chosen = (dialog.querySelector('mat-select')?.innerText || '').trim();
+        if (chosen === name) {
+          create.click();
+          await sleep(3000);
+          continue;
+        }
+        if (chosen && !/loading/i.test(chosen)) {
+          // dialog đang chọn project khác: đóng lại, mở đúng từ dòng của project
+          closeBtn()?.click();
+          await sleep(600);
+          continue;
+        }
+      } else if (!dialog) {
+        // không có dialog nào (kể cả dialog đang tạo key dở) thì mới mở từ dòng của project
+        const open = projectRow(name)?.querySelector('button.api-key-create-button');
+        if (visible(open)) {
+          open.click();
+          await sleep(1000);
+          continue;
+        }
+      }
+      await sleep(300);
+    }
+    throw new Error('Không tạo được key cho ' + name);
+  };
+
   const onProjects = () => document.querySelector('button[aria-label="Create a new project"]');
   /** Đưa trang về danh sách Projects dù đang kẹt ở dialog hay trang API keys. */
   const backToProjects = async () => {
     for (let i = 0; i < 3; i++) {
-      const close = document.querySelector('button[aria-label="close"]');
+      const close = closeBtn();
       if (!visible(close)) break;
       close.click();
       await sleep(400);
@@ -81,36 +124,34 @@
   // Giai đoạn 1: chỉ tạo project + key, chưa lấy key
   const createOne = async (name) => {
     // dialog của project trước còn mở thì đóng lại đã
-    const stale = document.querySelector('button[aria-label="close"]');
-    if (visible(stale)) {
+    const stale = closeBtn();
+    if (stale) {
       stale.click();
       await sleep(400);
     }
-    await step('Create a new project', onProjects);
-    const input = await waitFor(
-      () => document.querySelector('input[aria-label="Name your project"]'),
-      'ô Name your project'
-    );
-    setValue(input, name);
-    await sleep(300);
-    await step('Create project', () => byText('button.ms-button-primary', 'Create project'));
-    // chờ Google tạo project xong rồi tạo key
-    await step('Create key', () => byText('button.ms-button-primary', 'Create key'), 120000);
-    // project hiện trong bảng kèm nút View API keys = đã tạo xong
-    await waitFor(
-      () => projectRow(name)?.querySelector('button[aria-label="View API keys"]'),
-      'project ' + name + ' trong bảng',
-      120000
-    );
+    // project đã có từ lần chạy trước thì không tạo trùng, chỉ bổ sung key nếu thiếu
+    if (!projectRow(name)) {
+      await step('Create a new project', onProjects);
+      const input = await waitFor(
+        () => document.querySelector('input[aria-label="Name your project"]'),
+        'ô Name your project'
+      );
+      setValue(input, name);
+      await sleep(300);
+      await step('Create project', () => byText('button.ms-button-primary', 'Create project'));
+      // chờ Google tạo project xong: dialog tạo key tự mở, hoặc project hiện trong bảng
+      await waitFor(
+        () => byText('mat-dialog-container button', 'Create key', true) || projectRow(name),
+        'project ' + name + ' sau khi tạo',
+        120000
+      );
+    }
+    await ensureKey(name);
   };
 
   // Giai đoạn 2: mở project theo tên và lấy key
   const readKey = async (name) => {
-    await step(
-      'View API keys',
-      () => projectRow(name)?.querySelector('button[aria-label="View API keys"]'),
-      20000
-    );
+    await step('View API keys', () => viewKeysBtn(name), 20000);
     await waitFor(
       () => location.pathname.endsWith('/api-keys') && document.querySelector('button.key-string-link'),
       'trang API keys',
