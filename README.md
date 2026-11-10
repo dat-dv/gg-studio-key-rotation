@@ -116,7 +116,7 @@ Copy nguyên bảng Rate limits trên AI Studio, paste vào ô import. Chỉ nh�
 
 ### 3. Cấp key cho nơi dùng (tab **Client keys**)
 
-Nhập tên, tick các model được phép (không tick = mọi model), bấm tạo. Key chỉ hiện một lần. Kèm theo là lệnh curl mẫu, chọn được gọi qua **Domain** (từ ngoài vào) hay **Local** (service cùng docker network hoặc cùng máy) và theo chuẩn OpenAI hay Gemini. Địa chỉ mặc định lấy từ `PUBLIC_BASE_URL` / `LOCAL_BASE_URL`, sửa được ngay trên UI; nút **Curl** ở mỗi dòng mở lại lệnh mẫu cho key đã tạo.
+Nhập tên, tick các model được phép (không tick = mọi model), bấm tạo. Key chỉ hiện một lần. Kèm theo là lệnh curl mẫu, chọn được gọi qua **Domain** (từ ngoài vào) hay **Local** (service cùng docker network hoặc cùng máy) và theo chuẩn OpenAI hay Gemini. Địa chỉ mặc định lấy từ `PUBLIC_BASE_URL` / `LOCAL_BASE_URL`, sửa được ngay trên UI; bấm vào **key** ở mỗi dòng để mở thông tin của key (trạng thái, model được phép, lượng dùng hôm nay) kèm lệnh mẫu đúng endpoint cho từng loại model.
 
 ### 4. Gọi API
 
