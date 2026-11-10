@@ -12,7 +12,13 @@ export class ClientsController {
     return this.clients.list();
   }
 
-  /** Response chứa `token` — lần duy nhất token đầy đủ được trả ra. */
+  /** Key đầy đủ của một client (409 nếu key tạo trước khi gateway lưu lại). */
+  @Get(':id/reveal')
+  reveal(@Param('id', ParseIntPipe) id: number) {
+    return this.clients.reveal(id);
+  }
+
+  /** Response chứa `token` đầy đủ; sau đó xem lại qua GET :id/reveal. */
   @Post()
   create(@Body() body: any) {
     return this.clients.create(body || {});

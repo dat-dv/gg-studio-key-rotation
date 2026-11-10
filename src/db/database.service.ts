@@ -74,12 +74,14 @@ export class DatabaseService implements OnApplicationShutdown {
         PRIMARY KEY (key_id, model_id)
       );
 
-      -- key cấp cho client gọi vào gateway; chỉ lưu hash. allowed_models: JSON array, [] = mọi model
+      -- key cấp cho client gọi vào gateway. Xác thực bằng token_hash; token (plaintext) chỉ để admin xem lại,
+      -- NULL với key tạo trước khi có cột này. allowed_models: JSON array, [] = mọi model
       CREATE TABLE IF NOT EXISTS client_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         token_hash TEXT NOT NULL UNIQUE,
         token_prefix TEXT NOT NULL,
+        token TEXT,
         allowed_models TEXT NOT NULL DEFAULT '[]',
         enabled INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
@@ -88,6 +90,8 @@ export class DatabaseService implements OnApplicationShutdown {
     `);
     const cols = this.db.prepare(`PRAGMA table_info(request_log)`).all() as { name: string }[];
     if (!cols.some((c) => c.name === 'client_id')) this.db.exec('ALTER TABLE request_log ADD COLUMN client_id INTEGER');
+    const clientCols = this.db.prepare(`PRAGMA table_info(client_keys)`).all() as { name: string }[];
+    if (!clientCols.some((c) => c.name === 'token')) this.db.exec('ALTER TABLE client_keys ADD COLUMN token TEXT');
     // capability sửa tay; '' = tự đoán theo tên/category (xem limits/capability.ts)
     const limitCols = this.db.prepare(`PRAGMA table_info(model_limits)`).all() as { name: string }[];
     if (!limitCols.some((c) => c.name === 'capability'))

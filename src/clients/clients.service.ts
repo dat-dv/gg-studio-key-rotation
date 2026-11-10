@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { quotaDayStart } from '../common/time';
 import { DatabaseService } from '../db/database.service';
@@ -17,6 +17,8 @@ interface Row {
   name: string;
   token_hash: string;
   token_prefix: string;
+  /** key đầy đủ để admin xem lại; null với key tạo trước khi gateway lưu lại */
+  token: string | null;
   allowed_models: string;
   enabled: number;
   created_at: number;
@@ -27,7 +29,8 @@ export const hashToken = (t: string) => createHash('sha256').update(t).digest('h
 
 /**
  * Key cấp cho nơi khác gọi vào gateway (khác với API key Google ở tab Keys).
- * Chỉ lưu SHA-256 của token: token đầy đủ chỉ hiện đúng 1 lần lúc tạo.
+ * Request được xác thực bằng SHA-256 của token. Token đầy đủ cũng được lưu (plaintext, như key Google)
+ * để admin xem lại trên UI; key tạo từ trước khi có tính năng này thì chỉ có hash.
  */
 @Injectable()
 export class ClientsService {
@@ -93,6 +96,7 @@ export class ClientsService {
       id: r.id,
       name: r.name,
       tokenPrefix: r.token_prefix,
+      revealable: !!r.token,
       allowedModels: this.parseModels(r),
       enabled: !!r.enabled,
       createdAt: r.created_at,
@@ -108,10 +112,19 @@ export class ClientsService {
     const models = this.normalizeModels(dto.allowedModels);
     const token = `sk-gg-${randomBytes(24).toString('base64url')}`;
     const info = this.db
-      .prepare('INSERT INTO client_keys (name, token_hash, token_prefix, allowed_models, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(name, hashToken(token), token.slice(0, 11), JSON.stringify(models), Date.now());
+      .prepare('INSERT INTO client_keys (name, token_hash, token_prefix, token, allowed_models, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(name, hashToken(token), token.slice(0, 11), token, JSON.stringify(models), Date.now());
     this.invalidate();
     return { id: Number(info.lastInsertRowid), name, token, allowedModels: models };
+  }
+
+  /** Key đầy đủ để admin xem lại. */
+  reveal(id: number) {
+    const row = this.db.prepare('SELECT token FROM client_keys WHERE id=?').get(id) as { token: string | null } | undefined;
+    if (!row) throw new NotFoundException(`Client key #${id} not found`);
+    if (!row.token)
+      throw new ConflictException('Key này tạo trước khi gateway lưu key đầy đủ nên không xem lại được. Hãy tạo key mới để thay.');
+    return { token: row.token };
   }
 
   update(id: number, dto: { name?: string; allowedModels?: unknown; enabled?: boolean }) {
