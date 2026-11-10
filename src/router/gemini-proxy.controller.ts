@@ -562,6 +562,7 @@ export class GeminiProxyController {
             exclude,
             client.id,
             client.dailyLimit,
+            autoPicked,
           );
         } catch (e: any) {
           // Redis giữ bộ đếm quota: không đọc được thì không chọn key an toàn được -> báo 503, không gọi mù lên Google
@@ -819,14 +820,14 @@ export class GeminiProxyController {
             });
             // Gateway tự chọn model mà Google không biết model này (id trong bảng limits chưa đúng) -> thử model kế
             if (autoPicked && up.status === 404) {
-              // 404 là lỗi của model chứ không phải của key: khoá model này trên mọi key 1 giờ để các
-              // request sau bỏ qua luôn, không tốn 1 lượt gọi mỗi request. Sửa model id ở tab Limits
-              // hoặc xoá cooldown ở tab Quota thì thử lại ngay.
+              // 404 là lỗi của model chứ không phải của key: khoá ở mức model 1 giờ (không đặt cooldown lên
+              // từng key) để các request sau bỏ qua luôn, không tốn 1 lượt gọi mỗi request. Sửa model id ở
+              // tab Limits hoặc bỏ khoá ở tab Quota thì thử lại ngay.
               const until = Date.now() + MODEL_NOT_FOUND_COOLDOWN_MS;
-              await Promise.all(
-                this.keys
-                  .enabledKeys()
-                  .map((k) => this.quota.setCooldown(k.id, limit.modelId, until, "404 model not found")),
+              await this.quota.blockModel(
+                limit.modelId,
+                until,
+                `Google trả 404: ${ce.message}`.slice(0, 200),
               );
               this.log.warn(
                 `${limit.modelId}: Google trả 404 -> bỏ qua model này tới ${new Date(until).toISOString()}, kiểm tra lại model id ở tab Limits`,
@@ -873,6 +874,7 @@ export class GeminiProxyController {
       if (retryAfter) res.setHeader("Retry-After", String(retryAfter));
       const names = exhausted.map((e) => e.limit.displayName).join(", ");
       const allPaused = exhausted.every((e) => e.reason === "paused");
+      const allBlocked = exhausted.every((e) => e.reason === "model_blocked");
       return res.status(allPaused ? 503 : 429).json(
         errBody(
           t.fmt,
@@ -883,6 +885,9 @@ export class GeminiProxyController {
             : allPaused
               ? `Google đang quá tải ${names} (nhiều key cùng bị từ chối), gateway tạm nghỉ` +
                 (retryAfter ? ` — thử lại sau ~${retryAfter}s` : "")
+              : allBlocked
+                ? `Google trả 404 cho ${names}, gateway tạm bỏ qua. Kiểm tra model id ở tab Limits` +
+                  (retryAfter ? ` — thử lại sau ~${retryAfter}s` : "")
               : `Tất cả key đã hết quota local cho ${names}` +
                 (retryAfter ? ` — thử lại sau ~${retryAfter}s` : ""),
           {

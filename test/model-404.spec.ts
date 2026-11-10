@@ -80,16 +80,44 @@ test('model gateway tự chọn bị Google trả 404: chỉ thử 1 lần, các
   assert.equal(hits[GONE], 1, 'model 404 không được gọi lại');
   assert.equal(hits[GOOD], 4);
 
-  const usage = (await (await json('/api/usage', 'GET')).json()) as { cooldowns: { modelId: string; reason: string }[] };
-  const cds = usage.cooldowns.filter((x) => x.modelId === GONE);
-  assert.equal(cds.length, 2, 'khoá trên cả 2 key');
-  assert.match(cds[0].reason, /404/);
+  const usage = (await (await json('/api/usage', 'GET')).json()) as {
+    cooldowns: { modelId: string }[];
+    modelBlocks: { modelId: string; reason: string; until: number }[];
+  };
+  assert.equal(usage.cooldowns.length, 0, 'không đặt cooldown lên từng key');
+  assert.equal(usage.modelBlocks.length, 1, 'khoá 1 lần ở mức model');
+  assert.equal(usage.modelBlocks[0].modelId, GONE);
+  assert.match(usage.modelBlocks[0].reason, /404/);
+  assert.ok(usage.modelBlocks[0].until > Date.now());
+
+  const quota = (await (await json('/v1/quota', 'GET', undefined, c.token)).json()) as {
+    models: { model: string; remainingToday: number | null; unavailableReason: string | null }[];
+  };
+  const gone = quota.models.find((m) => m.model === GONE)!;
+  assert.match(gone.unavailableReason ?? '', /404/);
+  assert.equal(gone.remainingToday, 0);
+});
+
+test('chỉ còn model bị 404: báo rõ lý do, không gọi Google', async () => {
+  const c = (await (await json('/api/clients', 'POST', { name: 'only-gone', allowedModels: [GONE] })).json()) as { token: string };
+  const before = hits[GONE];
+  const res = await json('/v1beta/models/auto:generateContent', 'POST', { contents: [{ parts: [{ text: 'hi' }] }] }, c.token);
+  assert.equal(res.status, 429);
+  assert.match(((await res.json()) as { error: { message: string } }).error.message, /404/);
+  assert.equal(hits[GONE], before);
+});
+
+test('bỏ khoá model thì gateway thử lại model đó', async () => {
+  const c = (await (await json('/api/clients', 'POST', { name: 'auto2', allowedModels: [GONE, GOOD] })).json()) as { token: string };
+  const before = hits[GONE];
+  assert.equal((await json(`/api/model-blocks/${GONE}`, 'DELETE')).status, 200);
+  const res = await json('/v1beta/models/auto:generateContent', 'POST', { contents: [{ parts: [{ text: 'hi' }] }] }, c.token);
+  assert.equal(res.status, 200);
+  assert.equal(hits[GONE], before + 1);
 });
 
 test('gọi đích danh model bị 404 thì vẫn trả nguyên lỗi của Google', async () => {
-  // xoá cooldown để request tới được Google
-  const keys = (await (await json('/api/keys', 'GET')).json()) as { id: number }[];
-  for (const k of keys) await json(`/api/cooldowns/${k.id}/${GONE}`, 'DELETE');
+  // model đang bị khoá (test trên vừa 404 lại) nhưng gọi đích danh thì vẫn tới Google
   const before = hits[GONE];
   const c = (await (await json('/api/clients', 'POST', { name: 'direct' })).json()) as { token: string };
   const res = await json(`/v1beta/models/${GONE}:generateContent`, 'POST', { contents: [{ parts: [{ text: 'hi' }] }] }, c.token);

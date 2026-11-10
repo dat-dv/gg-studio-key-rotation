@@ -21,6 +21,7 @@ function renderQuota() {
     [new Set(enabled.map((k) => k.account)).size, 'account'],
     [totalToday, 'request hôm nay'],
     [state.cooldowns.length, 'cặp key·model đang cooldown'],
+    ...((state.modelBlocks || []).length ? [[state.modelBlocks.length, 'model Google trả 404']] : []),
   ].map(([b, s]) => `<div class="stat"><b>${b}</b><span>${s}</span></div>`).join('');
 
   $('#quotaBody').innerHTML = limits.map((l) => {
@@ -28,7 +29,9 @@ function renderQuota() {
     const sum = pool.reduce((s, k) => { const u = usageOf(k.id, l.modelId); return { rpm: s.rpm + u.rpm, tpm: s.tpm + u.tpm, rpd: s.rpd + u.rpd }; }, { rpm: 0, tpm: 0, rpd: 0 });
     const mul = (v) => v == null ? null : v * pool.length;
     let last;
+    const blocked = modelBlock(l.modelId);
     if (l.unavailableReason) last = `<span class="badge muted">${esc(l.unavailableReason)}</span>`;
+    else if (blocked) last = `<span class="badge bad" title="${esc(blocked.reason)}">Model 404 · bỏ qua ${dur(blocked.until - Date.now())}</span> <button class="btn sm" onclick="unblockModel('${esc(l.modelId)}')">Thử lại</button>`;
     else if (single) {
       const cd = state.cooldowns.find((c) => c.keyId === single.id && c.modelId === l.modelId);
       last = !single.enabled ? '<span class="badge bad">Key tắt</span>'
@@ -44,6 +47,7 @@ function renderQuota() {
 }
 $('#quotaKey').onchange = renderQuota;
 $('#hideZero').onchange = renderQuota;
+async function unblockModel(modelId) { await api(`/api/model-blocks/${encodeURIComponent(modelId)}`, { method: 'DELETE' }); refresh(); }
 async function clearCdModel(keyId, modelId) { await api(`/api/cooldowns/${keyId}/${encodeURIComponent(modelId)}`, { method: 'DELETE' }); refresh(); }
 
 page.onState.push(renderQuota);

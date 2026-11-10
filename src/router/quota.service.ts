@@ -51,7 +51,7 @@ export type ReserveResult =
     }
   | {
       ok: false;
-      reason: 'no_keys' | 'exhausted' | 'client_limit' | 'paused';
+      reason: 'no_keys' | 'exhausted' | 'client_limit' | 'paused' | 'model_blocked';
       retryAt: number | null;
       detail: string[];
       /** mọi key còn lại chỉ đang bận (đủ số request đồng thời), không hết quota: chờ chút là có */
@@ -72,6 +72,7 @@ export type ReserveResult =
  *   inf:<keyId>                  ZSET logId -> ts, request đang chạy trên key  (dọn mục quá 15 phút)
  *   ovl:<modelId>                ZSET keyId -> ts, key vừa bị Google từ chối vì quá tải (429 không rõ quota / 503)
  *   pause:<modelId>              thời điểm hết tạm nghỉ model vì Google đang quá tải
+ *   gone:<modelId>               "<until>|<reason>": model Google trả 404, gateway không tự chọn model này nữa (tự hết hạn)
  *   seeded                       đã nạp bộ đếm từ request_log (Redis mới / mất dữ liệu thì nạp lại)
  */
 
@@ -82,8 +83,10 @@ export type ReserveResult =
  * tới sau luôn thấy số của request tới trước.
  * Model đang tạm nghỉ vì Google quá tải -> trả 'paused', không gọi key nào. Key đã có đủ maxInflight request đang
  * chạy thì bỏ qua ('busy') để một đợt request dồn không đổ hết vào một key.
+ * Model đang bị khoá vì Google trả 404 (gone:) -> trả 'blocked' khi honorBlock = 1 (gateway tự chọn model); client
+ * gọi đích danh model thì vẫn cho đi để nhận nguyên lỗi của Google.
  * ARGV: prefix, now, dayStart, dayEnd, model, estTokens, logId, rpm, tpm, rpd, clientId, clientLimit, maxInflight,
- *       rồi (keyId, excluded)*
+ *       honorBlock, rồi (keyId, excluded)*
  */
 const LUA_RESERVE = `
 local P = ARGV[1]
@@ -97,7 +100,7 @@ local rpm, tpm, rpd = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
 local clientId = ARGV[11]
 local clientLimit = tonumber(ARGV[12])
 local maxInf = tonumber(ARGV[13]) or 0
-local BASE = 13
+local BASE = 14
 local n = (#ARGV - BASE) / 2
 local dayTtl = math.floor(dayEnd / 1000) + 3600
 local cut = '(' .. string.format('%d', now - 60000)
@@ -109,6 +112,15 @@ end
 
 local pauseUntil = tonumber(redis.call('GET', P .. 'pause:' .. model) or '0')
 if pauseUntil > now then return {0, 'paused', string.format('%d', pauseUntil)} end
+
+if ARGV[14] == '1' then
+  local gone = redis.call('GET', P .. 'gone:' .. model)
+  if gone then
+    local sep = string.find(gone, '|', 1, true)
+    local u = tonumber(string.sub(gone, 1, sep - 1))
+    if u > now then return {0, 'blocked', string.format('%d', u), string.sub(gone, sep + 1)} end
+  end
+end
 
 local staleInf = '(' .. string.format('%d', now - 900000)
 local function busy(keyId)
@@ -387,7 +399,12 @@ type Scripts = {
   ggRemaining(...args: (string | number)[]): Promise<[string, [number, number, string, number, string][]]>;
   ggReserve(
     ...args: (string | number)[]
-  ): Promise<[1, number, number, number] | [0, 'client_limit' | 'paused', string] | [0, 'exhausted', string, [number, string, string][]]>;
+  ): Promise<
+    | [1, number, number, number]
+    | [0, 'client_limit' | 'paused', string]
+    | [0, 'blocked', string, string]
+    | [0, 'exhausted', string, [number, string, string][]]
+  >;
   ggOverload(...args: (string | number)[]): Promise<[number, string, number]>;
   ggFinalize(...args: (string | number)[]): Promise<number>;
   ggCooldown(...args: (string | number)[]): Promise<number>;
@@ -581,7 +598,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   async resetCounters(wipeCooldowns = false) {
     this.flush();
     this.inflight.clear();
-    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*'] : [])];
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
       for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
@@ -652,6 +669,41 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     }
   }
 
+  /**
+   * Google trả 404 cho model gateway tự chọn: lỗi của model chứ không phải của key, nên khoá ở mức model (1 key
+   * Redis, không đặt cooldown lên từng key). Không ném lỗi.
+   */
+  async blockModel(modelId: string, until: number, reason: string) {
+    try {
+      const ttl = Math.max(1000, Math.floor(until - Date.now()));
+      await this.r.set(`${this.P}gone:${modelId}`, `${Math.floor(until)}|${reason.replace(/\s+/g, ' ').slice(0, 300)}`, 'PX', ttl);
+    } catch (e: any) {
+      this.log.error(`blockModel ${modelId}: ${e?.message || e}`);
+    }
+  }
+
+  /** Bỏ khoá model (nút trên tab Quota, hoặc sau khi sửa model id ở tab Limits). */
+  async unblockModel(modelId: string) {
+    await this.r.del(`${this.P}gone:${modelId}`);
+  }
+
+  /** Các model đang bị khoá vì Google trả 404 (dashboard, /v1/quota). */
+  async listModelBlocks(now = Date.now()) {
+    const out: { modelId: string; until: number; reason: string }[] = [];
+    const keys = await this.redis.scan('gone:*');
+    if (!keys.length) return out;
+    const vals = await this.r.mget(...keys); // scan trả key đã kèm prefix
+    const skip = this.P.length + 'gone:'.length;
+    keys.forEach((k, i) => {
+      const v = vals[i];
+      if (!v) return;
+      const sep = v.indexOf('|');
+      const until = Number(v.slice(0, sep));
+      if (until > now) out.push({ modelId: k.slice(skip), until, reason: v.slice(sep + 1) });
+    });
+    return out;
+  }
+
   /** Bỏ cooldown (nút trên tab Quota) và xoá luôn chuỗi 429 liên tiếp để lần sau tính lại từ đầu. */
   async clearCooldown(keyId: number, modelId?: string) {
     if (modelId) await this.r.del(`${this.P}pause:${modelId}`, `${this.P}ovl:${modelId}`);
@@ -666,7 +718,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
 
   /** Bỏ cooldown của 1 model trên mọi key (model bị đổi id / sửa ở tab Limits). */
   async clearModelCooldowns(modelId: string) {
-    await this.r.del(`${this.P}pause:${modelId}`, `${this.P}ovl:${modelId}`);
+    await this.r.del(`${this.P}pause:${modelId}`, `${this.P}ovl:${modelId}`, `${this.P}gone:${modelId}`);
     const keys = await this.redis.scan('cd:*');
     if (!keys.length) return;
     const pipe = this.r.pipeline();
@@ -709,6 +761,8 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     clientId: number | null = null,
     /** hạn mức request/ngày của client key; null = không giới hạn riêng */
     clientLimit: number | null = null,
+    /** gateway tự chọn model: bỏ qua model đang bị khoá vì Google trả 404 */
+    honorBlock = false,
   ): Promise<ReserveResult> {
     const now = Date.now();
     const { start, end } = this.day(now);
@@ -731,6 +785,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       clientId != null && clientLimit != null ? clientId : '',
       num(clientLimit),
       this.maxInflightPerKey,
+      honorBlock ? 1 : 0,
       ...keys.flatMap((k) => [k.id, exclude.has(k.id) ? 1 : 0]),
     );
 
@@ -740,6 +795,10 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       if (res[1] === 'paused') {
         const until = Number(res[2]);
         return { ok: false, reason: 'paused', retryAt: until, detail: [`Google đang quá tải ${limit.modelId}, tạm nghỉ tới ${new Date(until).toISOString()}`] };
+      }
+      if (res[1] === 'blocked') {
+        const until = Number(res[2]);
+        return { ok: false, reason: 'model_blocked', retryAt: until, detail: [`${res[3]}: gateway bỏ qua model này tới ${new Date(until).toISOString()}`] };
       }
       const skipped = (res as [0, 'exhausted', string, [number, string, string][]])[3];
       const retryAt = Number(res[2]);
@@ -842,6 +901,14 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
         m.keys.nextAvailableAt = Math.min(m.keys.nextAvailableAt ?? until, until);
       });
     }
+    // model Google trả 404: gateway không tự chọn nữa cho tới khi hết khoá
+    for (const b of await this.listModelBlocks(now)) {
+      const m = out.find((x) => x.limit.modelId === b.modelId);
+      if (!m || m.unavailableReason) continue;
+      m.unavailableReason = b.reason;
+      m.keys.available = 0;
+      m.keys.nextAvailableAt = b.until;
+    }
     return { now, dayStart: start, resetAt: end, clientUsed: used === '' ? null : Number(used), models: out };
   }
 
@@ -894,7 +961,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       const u = { rpm: Number(rpm), tpm: Number(tpm), rpd: Number(rpd) };
       if (u.rpd || u.rpm) (usage[Number(pair.slice(0, sep))] ||= {})[pair.slice(sep + 1)] = u;
     }
-    return { now, dayStart: start, dayEnd: end, usage, cooldowns: await this.listCooldowns(now) };
+    return { now, dayStart: start, dayEnd: end, usage, cooldowns: await this.listCooldowns(now), modelBlocks: await this.listModelBlocks(now) };
   }
 
   /** Một trang log, mới nhất trước. page bắt đầu từ 1; page vượt quá thì trả trang cuối. */

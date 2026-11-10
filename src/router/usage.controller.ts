@@ -33,6 +33,13 @@ export class UsageController {
     return this.quota.logs(Number(page) || 1, Number(pageSize) || 50);
   }
 
+  /** Bỏ khoá model bị Google trả 404 để gateway thử lại ngay. */
+  @Delete('model-blocks/:modelId')
+  async unblock(@Param('modelId') modelId: string) {
+    await this.quota.unblockModel(modelId);
+    return { ok: true };
+  }
+
   @Delete('cooldowns/:keyId')
   async clearAll(@Param('keyId', ParseIntPipe) keyId: number) {
     await this.quota.clearCooldown(keyId);

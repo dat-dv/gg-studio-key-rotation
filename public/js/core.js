@@ -7,7 +7,7 @@ const dur = (ms) => { ms = Math.max(0, ms); const s = Math.round(ms / 1000); if 
 const BOOT = JSON.parse($('#boot').textContent);
 /** Loại model -> nhãn và cách gọi; nguồn duy nhất là CAPABILITY_UI ở src/limits/capability.ts. */
 const CAPS = BOOT.capabilities;
-let state = { keys: [], limits: [], usage: {}, cooldowns: [], now: Date.now(), dayEnd: 0 };
+let state = { keys: [], limits: [], usage: {}, cooldowns: [], modelBlocks: [], now: Date.now(), dayEnd: 0 };
 /**
  * Mỗi URL là một trang riêng, chỉ nạp script của trang đó. Script của trang đăng ký vào đây
  * để core gọi lại mà không cần biết trang nào đang mở.
@@ -46,6 +46,8 @@ async function refresh() {
 }
 
 function cooldownsFor(keyId) { return state.cooldowns.filter((c) => c.keyId === keyId); }
+/** Model Google trả 404: gateway tạm không tự chọn (khoá ở mức model, không phải cooldown của key). */
+function modelBlock(modelId) { return (state.modelBlocks || []).find((b) => b.modelId === modelId); }
 function usageOf(keyId, modelId) { return state.usage[keyId]?.[modelId] || { rpm: 0, tpm: 0, rpd: 0 }; }
 function keyAvailable(k, l) {
   if (!k.enabled) return false;
