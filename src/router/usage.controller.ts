@@ -29,8 +29,8 @@ export class UsageController {
   }
 
   @Get('logs')
-  logs(@Query('limit') limit?: string) {
-    return this.quota.logs(Number(limit) || 200);
+  logs(@Query('page') page?: string, @Query('pageSize') pageSize?: string) {
+    return this.quota.logs(Number(page) || 1, Number(pageSize) || 50);
   }
 
   @Delete('cooldowns/:keyId')

@@ -424,15 +424,23 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     return { now, dayStart: start, dayEnd: end, usage, cooldowns };
   }
 
-  logs(limit = 200) {
+  /** Một trang log, mới nhất trước. page bắt đầu từ 1; page vượt quá thì trả trang cuối. */
+  logs(page = 1, pageSize = 50) {
     this.flush();
-    return this.db
+    const size = Math.min(Math.max(Math.floor(pageSize) || 50, 1), 500);
+    const { total } = this.db
+      .prepare('SELECT COUNT(*) AS total FROM request_log l JOIN api_keys k ON k.id = l.key_id')
+      .get() as { total: number };
+    const pages = Math.max(1, Math.ceil(total / size));
+    const cur = Math.min(Math.max(Math.floor(page) || 1, 1), pages);
+    const items = this.db
       .prepare(
         `SELECT l.id, l.ts, l.model_id AS modelId, l.requested_model AS requestedModel, l.tokens, l.status,
                 l.http_status AS httpStatus, l.error, l.latency_ms AS latencyMs, k.id AS keyId, k.account, k.project, c.name AS client
          FROM request_log l JOIN api_keys k ON k.id = l.key_id LEFT JOIN client_keys c ON c.id = l.client_id
-         ORDER BY l.id DESC LIMIT ?`,
+         ORDER BY l.id DESC LIMIT ? OFFSET ?`,
       )
-      .all(Math.min(Math.max(limit, 1), 1000));
+      .all(size, (cur - 1) * size);
+    return { items, total, page: cur, pageSize: size, pages };
   }
 }

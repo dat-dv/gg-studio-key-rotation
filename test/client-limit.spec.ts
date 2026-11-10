@@ -113,3 +113,26 @@ test('dailyLimit không hợp lệ bị từ chối', async () => {
   for (const bad of [0, -3, 1.5, 'abc'])
     assert.equal((await json('/api/clients', 'POST', { name: 'bad', dailyLimit: bad })).status, 400, String(bad));
 });
+
+test('GET /api/logs phân trang: mới nhất trước, page vượt quá thì về trang cuối', async () => {
+  type Page = { items: { id: number }[]; total: number; page: number; pageSize: number; pages: number };
+  const get = async (q: string) => (await (await json(`/api/logs?${q}`, 'GET')).json()) as Page;
+
+  const p1 = await get('pageSize=1');
+  assert.ok(p1.total >= 2, `cần ít nhất 2 dòng log, có ${p1.total}`);
+  assert.equal(p1.items.length, 1);
+  assert.equal(p1.page, 1);
+  assert.equal(p1.pages, p1.total);
+
+  const p2 = await get('pageSize=1&page=2');
+  assert.equal(p2.page, 2);
+  assert.ok(p2.items[0].id < p1.items[0].id, 'trang 2 phải cũ hơn trang 1');
+
+  const far = await get('pageSize=1&page=99999');
+  assert.equal(far.page, far.pages);
+  assert.equal(far.items.length, 1);
+
+  const all = await get('');
+  assert.equal(all.pageSize, 50);
+  assert.equal(all.items.length, Math.min(50, all.total));
+});
