@@ -85,13 +85,26 @@ $('#keysJsonFile').onchange = async (ev) => {
   updatePreview();
 };
 
-/** Script chạy trong Console của AI Studio để tạo hàng loạt project + key, xuất ra JSON nạp được ở trên. */
+/**
+ * Script chạy trong Console của AI Studio để tạo hàng loạt project + key, xuất ra JSON nạp được ở trên.
+ * Hỏi prefix trước, điền sẵn vào script rồi mới copy, nên dán vào Console là chạy luôn.
+ */
+const PREFIX_SLOT = "const PREFIX = '';";
 $('#copyCreateScript').onclick = async () => {
+  let last = '';
+  try { last = localStorage.getItem('createKeyPrefix') || ''; } catch {}
+  const answer = prompt('Name prefix cho project (vd: datvan193). Script sẽ tạo <prefix>-1 … <prefix>-10:', $('#account').value.trim() || last);
+  if (answer == null) return;
+  const prefix = answer.trim();
+  if (!prefix) return toast('Chưa nhập prefix, chưa copy.');
   try {
     const res = await fetch('/tools/aistudio-create-project-key.js', { cache: 'no-cache' });
     if (!res.ok) throw new Error('Không tải được script (' + res.status + ')');
-    await navigator.clipboard.writeText(await res.text());
-    toast('Đã copy script. Dán vào Console ở aistudio.google.com/projects');
+    const src = await res.text();
+    if (!src.includes(PREFIX_SLOT)) throw new Error('Script thiếu chỗ điền prefix');
+    await navigator.clipboard.writeText(src.replace(PREFIX_SLOT, () => `const PREFIX = ${JSON.stringify(prefix)};`));
+    try { localStorage.setItem('createKeyPrefix', prefix); } catch {}
+    toast(`Đã copy script với prefix "${prefix}". Dán vào Console ở aistudio.google.com/projects`);
   } catch (e) { toast(e.message); }
 };
 

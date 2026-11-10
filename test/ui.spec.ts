@@ -119,5 +119,9 @@ test('trang Keys có nút copy script tạo key và script tải được', asyn
   assert.ok((await (await fetch(base + '/keys')).text()).includes('id="copyCreateScript"'));
   const res = await fetch(base + '/tools/aistudio-create-project-key.js');
   assert.equal(res.status, 200);
-  assert.ok((await res.text()).includes('JSON.stringify(result'));
+  const src = await res.text();
+  assert.ok(src.includes('JSON.stringify(result'));
+  // chỗ trang Keys điền prefix trước khi copy: phải khớp PREFIX_SLOT trong public/js/keys.js
+  assert.ok(src.includes("const PREFIX = '';"));
+  assert.ok((await (await fetch(base + '/js/keys.js')).text()).includes(`const PREFIX_SLOT = "const PREFIX = '';";`));
 });

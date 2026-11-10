@@ -4,8 +4,9 @@
 (async () => {
   const COUNT = 10; // số project cần tạo
   const START = 1; // số thứ tự bắt đầu (prefix-1, prefix-2, ...)
+  const PREFIX = ''; // trang Keys điền sẵn khi bấm copy; để trống thì script hỏi lúc chạy
 
-  const prefix = (prompt('Nhập name prefix cho project (vd: datvan193):', '') || '').trim();
+  const prefix = (PREFIX || prompt('Nhập name prefix cho project (vd: datvan193):', '') || '').trim();
   if (!prefix) return console.warn('Chưa nhập prefix, dừng.');
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
