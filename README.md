@@ -61,10 +61,11 @@ flowchart LR
 | 429 khác (quota theo phút, hoặc Google không nói rõ) | Khoá theo `retryDelay` (mặc định 60s), thử key khác. Cặp key + model bị 429 liên tiếp thì mỗi lần khoá gấp đôi, tối đa 1 giờ. Hết khoá thì chỉ **một** request được đi thử dò, các request khác bỏ qua cặp đó; thử thành công mới mở lại bình thường |
 | Key không hợp lệ / project bị khoá | Tắt hẳn key, thử key khác |
 | 403 khác | Khoá cặp key + model 1 giờ, thử key khác |
+| 429 không rõ quota hoặc 503 "high demand" trên nhiều key | Google đang quá tải model, không phải key hết quota. Đủ `OVERLOAD_THRESHOLD` key khác nhau bị trong 10s thì tạm nghỉ cả model `OVERLOAD_PAUSE_MS`, không khoá key, trả 503 kèm `Retry-After`. Một request gặp quá tải 2 lần ở một model thì sang model kế |
 | 5xx, lỗi mạng | Không phạt key, thử key khác |
 | 400 / 404 | Trả nguyên lỗi cho client, không thử lại |
 
-Thử tối đa `MAX_ATTEMPTS` key cho một request. Hết key thì trả 429 kèm `Retry-After`.
+Thử tối đa `MAX_ATTEMPTS` key cho một request. Hết key thì trả 429 kèm `Retry-After`. Việc thử lại dừng ở `ROUTER_DEADLINE_MS` (lần gọi đầu không bị cắt) để client nhận lỗi thay vì tự timeout. Mỗi key chạy tối đa `MAX_INFLIGHT_PER_KEY` request cùng lúc; dư thì chờ key rảnh.
 
 ### Redis giữ trạng thái quota, SQLite giữ log
 
@@ -195,6 +196,10 @@ Nút **Export** tải về file JSON gồm key Google, client keys, limits, usag
 | `ADMIN_TOKEN` | trống | Bảo vệ UI và admin API (`x-admin-token`) |
 | `PROXY_TOKEN` | trống | Key chủ gọi proxy, dùng mọi model |
 | `MAX_ATTEMPTS` | `4` | Số key tối đa thử cho một request |
+| `ROUTER_DEADLINE_MS` | `45000` | Quá mốc này thì không thử lại nữa; đặt thấp hơn timeout của client |
+| `MAX_INFLIGHT_PER_KEY` | `4` | Số request chạy đồng thời tối đa trên một key Google, `0` = không giới hạn |
+| `OVERLOAD_THRESHOLD` | `3` | Số key khác nhau bị Google từ chối vì quá tải trong 10s thì tạm nghỉ model |
+| `OVERLOAD_PAUSE_MS` | `15000` | Thời gian tạm nghỉ model khi Google quá tải |
 | `DB_PATH` | `./data/gg-studio.db` | File SQLite |
 | `REDIS_URL` | `redis://127.0.0.1:6379` (compose: `redis://gg-redis:6379`) | Redis giữ bộ đếm quota và cooldown, bắt buộc |
 | `REDIS_PREFIX` | `gg:` | Prefix key, đổi khi nhiều môi trường dùng chung một Redis |

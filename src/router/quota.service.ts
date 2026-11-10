@@ -49,7 +49,14 @@ export type ReserveResult =
       /** số request hôm nay của client key, đã tính cả request này; null khi key không có hạn mức riêng */
       clientUsed: number | null;
     }
-  | { ok: false; reason: 'no_keys' | 'exhausted' | 'client_limit'; retryAt: number | null; detail: string[] };
+  | {
+      ok: false;
+      reason: 'no_keys' | 'exhausted' | 'client_limit' | 'paused';
+      retryAt: number | null;
+      detail: string[];
+      /** mọi key còn lại chỉ đang bận (đủ số request đồng thời), không hết quota: chờ chút là có */
+      busyOnly?: boolean;
+    };
 
 /*
  * Key trong Redis (đều có prefix, mặc định "gg:"; <pair> = "<keyId>|<modelId>"):
@@ -62,6 +69,9 @@ export type ReserveResult =
  *   strike:<pair>                số lần liên tiếp Google trả 429 cho pair (về 0 khi có request thành công)
  *   probe:<pair>                 logId của request đang đi thử dò cho pair vừa bị 429 (TTL 60s)
  *   rr:<modelId>                 con trỏ xoay vòng
+ *   inf:<keyId>                  ZSET logId -> ts, request đang chạy trên key  (dọn mục quá 15 phút)
+ *   ovl:<modelId>                ZSET keyId -> ts, key vừa bị Google từ chối vì quá tải (429 không rõ quota / 503)
+ *   pause:<modelId>              thời điểm hết tạm nghỉ model vì Google đang quá tải
  *   seeded                       đã nạp bộ đếm từ request_log (Redis mới / mất dữ liệu thì nạp lại)
  */
 
@@ -70,7 +80,10 @@ export type ReserveResult =
  * chọn key ĐÃ DÙNG ÍT NHẤT rồi cộng bộ đếm ngay. Pair vừa bị 429 (còn strike) mà đã hết cooldown thì chỉ cho MỘT
  * request đi thử dò; các request khác bỏ qua pair đó cho tới khi request dò có kết quả. Cả đoạn chạy trong 1 script nên request (kể cả từ instance khác)
  * tới sau luôn thấy số của request tới trước.
- * ARGV: prefix, now, dayStart, dayEnd, model, estTokens, logId, rpm, tpm, rpd, clientId, clientLimit, rồi (keyId, excluded)*
+ * Model đang tạm nghỉ vì Google quá tải -> trả 'paused', không gọi key nào. Key đã có đủ maxInflight request đang
+ * chạy thì bỏ qua ('busy') để một đợt request dồn không đổ hết vào một key.
+ * ARGV: prefix, now, dayStart, dayEnd, model, estTokens, logId, rpm, tpm, rpd, clientId, clientLimit, maxInflight,
+ *       rồi (keyId, excluded)*
  */
 const LUA_RESERVE = `
 local P = ARGV[1]
@@ -83,7 +96,8 @@ local logId = ARGV[7]
 local rpm, tpm, rpd = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
 local clientId = ARGV[11]
 local clientLimit = tonumber(ARGV[12])
-local BASE = 12
+local maxInf = tonumber(ARGV[13]) or 0
+local BASE = 13
 local n = (#ARGV - BASE) / 2
 local dayTtl = math.floor(dayEnd / 1000) + 3600
 local cut = '(' .. string.format('%d', now - 60000)
@@ -91,6 +105,17 @@ local cut = '(' .. string.format('%d', now - 60000)
 if clientId ~= '' and clientLimit then
   local used = tonumber(redis.call('GET', P .. 'client:' .. dayStart .. ':' .. clientId) or '0')
   if used >= clientLimit then return {0, 'client_limit', tostring(used)} end
+end
+
+local pauseUntil = tonumber(redis.call('GET', P .. 'pause:' .. model) or '0')
+if pauseUntil > now then return {0, 'paused', string.format('%d', pauseUntil)} end
+
+local staleInf = '(' .. string.format('%d', now - 900000)
+local function busy(keyId)
+  if maxInf <= 0 then return false end
+  local ik = P .. 'inf:' .. keyId
+  redis.call('ZREMRANGEBYSCORE', ik, '-inf', staleInf)
+  return redis.call('ZCARD', ik) >= maxInf
 end
 
 local start = tonumber(redis.call('GET', P .. 'rr:' .. model) or '0') % n
@@ -126,6 +151,9 @@ for i = 0, n - 1 do
     elseif probing and redis.call('EXISTS', P .. 'probe:' .. pair) == 1 then
       retry(now + 2000)
       detail[#detail + 1] = {idx, 'probe', ''}
+    elseif busy(keyId) then
+      retry(now + 500)
+      detail[#detail + 1] = {idx, 'busy', tostring(maxInf)}
     else
       local wk, tk = P .. 'win:' .. pair, P .. 'tok:' .. pair
       local old = redis.call('ZRANGEBYSCORE', wk, '-inf', cut)
@@ -177,6 +205,10 @@ if clientId ~= '' then
   redis.call('EXPIREAT', ck, dayTtl)
 end
 redis.call('SET', P .. 'rr:' .. model, bestIdx + 1, 'EX', 172800)
+if maxInf > 0 then
+  redis.call('ZADD', P .. 'inf:' .. keyId, now, logId)
+  redis.call('PEXPIRE', P .. 'inf:' .. keyId, 900000)
+end
 if bestProbing then
   redis.call('SET', P .. 'probe:' .. pair, logId, 'PX', 60000)
   return {1, bestIdx, 1, clientUsed}
@@ -192,6 +224,7 @@ return {1, bestIdx, 0, clientUsed}
 const LUA_FINALIZE = `
 local P, pair, day, logId, counted, tokens, clientId = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
 local tk = P .. 'tok:' .. pair
+redis.call('ZREM', P .. 'inf:' .. string.sub(pair, 1, string.find(pair, '|', 1, true) - 1), logId)
 if redis.call('GET', P .. 'probe:' .. pair) == logId then redis.call('DEL', P .. 'probe:' .. pair) end
 if ARGV[8] == '1' then redis.call('DEL', P .. 'strike:' .. pair) end
 if counted == '1' then
@@ -253,6 +286,30 @@ redis.call('HSET', ck, model, string.format('%d', untilTs) .. '|' .. reason)
 local need = dur + 60000
 if redis.call('PTTL', ck) < need then redis.call('PEXPIRE', ck, need) end
 return {string.format('%d', untilTs), n}
+`;
+
+/**
+ * Google từ chối 1 cặp key+model vì quá tải (429 không kèm loại quota, hoặc 503 high demand). Đủ `threshold` key KHÁC
+ * NHAU cùng bị trong `windowMs` thì đây là lỗi phía model chứ không phải key: tạm nghỉ cả model `pauseMs`.
+ * ARGV: prefix, model, keyId, now, windowMs, threshold, pauseMs -> {paused 0|1, until, vừa đặt 0|1}
+ */
+const LUA_OVERLOAD = `
+local P, model, keyId = ARGV[1], ARGV[2], ARGV[3]
+local now, win, th, pause = tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
+local pk = P .. 'pause:' .. model
+local cur = tonumber(redis.call('GET', pk) or '0')
+if cur > now then return {1, string.format('%d', cur), 0} end
+local ok = P .. 'ovl:' .. model
+redis.call('ZADD', ok, now, keyId)
+redis.call('ZREMRANGEBYSCORE', ok, '-inf', '(' .. string.format('%d', now - win))
+redis.call('PEXPIRE', ok, win * 2)
+if redis.call('ZCARD', ok) >= th then
+  local u = now + pause
+  redis.call('SET', pk, string.format('%d', u), 'PX', pause + 1000)
+  redis.call('DEL', ok)
+  return {1, string.format('%d', u), 1}
+end
+return {0, '0', 0}
 `;
 
 /** Số liệu dashboard của mọi pair có hoạt động hôm nay. ARGV: prefix, now, dayStart -> {pair, rpd, rpm, tpm}* */
@@ -328,7 +385,10 @@ export interface ModelRemaining {
 
 type Scripts = {
   ggRemaining(...args: (string | number)[]): Promise<[string, [number, number, string, number, string][]]>;
-  ggReserve(...args: (string | number)[]): Promise<[1, number, number, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
+  ggReserve(
+    ...args: (string | number)[]
+  ): Promise<[1, number, number, number] | [0, 'client_limit' | 'paused', string] | [0, 'exhausted', string, [number, string, string][]]>;
+  ggOverload(...args: (string | number)[]): Promise<[number, string, number]>;
   ggFinalize(...args: (string | number)[]): Promise<number>;
   ggCooldown(...args: (string | number)[]): Promise<number>;
   ggBackoff(...args: (string | number)[]): Promise<[string, number]>;
@@ -347,6 +407,11 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   private readonly log = new Logger('Quota');
   /** request đang chờ kết quả: logId -> chỗ đã giữ + dòng log */
   private readonly inflight = new Map<number, { pair: string; day: number; row: LogRow }>();
+  /** số request tối đa đang chạy cùng lúc trên 1 key Google; 0 = không giới hạn */
+  private readonly maxInflightPerKey = Math.max(0, Number(process.env.MAX_INFLIGHT_PER_KEY ?? 4) || 0);
+  private readonly overloadWindowMs = Math.max(1000, Number(process.env.OVERLOAD_WINDOW_MS) || 10_000);
+  private readonly overloadThreshold = Math.max(1, Number(process.env.OVERLOAD_THRESHOLD) || 3);
+  private readonly overloadPauseMs = Math.max(1000, Number(process.env.OVERLOAD_PAUSE_MS) || 15_000);
   private dayCache = { start: 0, end: 0 };
 
   private nextLogId = 1;
@@ -367,6 +432,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     c.defineCommand('ggBackoff', { numberOfKeys: 0, lua: LUA_BACKOFF });
     c.defineCommand('ggSnapshot', { numberOfKeys: 0, lua: LUA_SNAPSHOT });
     c.defineCommand('ggRemaining', { numberOfKeys: 0, lua: LUA_REMAINING });
+    c.defineCommand('ggOverload', { numberOfKeys: 0, lua: LUA_OVERLOAD });
   }
 
   private get db() {
@@ -515,7 +581,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   async resetCounters(wipeCooldowns = false) {
     this.flush();
     this.inflight.clear();
-    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*'] : [])];
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
       for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
@@ -563,8 +629,32 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     }
   }
 
+  /**
+   * Ghi nhận 1 lần Google từ chối vì quá tải. Trả về model có đang tạm nghỉ không (và tới khi nào); justPaused = lần
+   * này vừa đặt tạm nghỉ (để log 1 lần). Không ném lỗi.
+   */
+  async overload(keyId: number, modelId: string) {
+    const now = Date.now();
+    try {
+      const [paused, until, just] = await this.scripts.ggOverload(
+        this.P,
+        modelId,
+        keyId,
+        now,
+        this.overloadWindowMs,
+        this.overloadThreshold,
+        this.overloadPauseMs,
+      );
+      return { paused: paused === 1, until: Number(until), justPaused: just === 1 };
+    } catch (e: any) {
+      this.log.error(`overload #${keyId} ${modelId}: ${e?.message || e}`);
+      return { paused: false, until: 0, justPaused: false };
+    }
+  }
+
   /** Bỏ cooldown (nút trên tab Quota) và xoá luôn chuỗi 429 liên tiếp để lần sau tính lại từ đầu. */
   async clearCooldown(keyId: number, modelId?: string) {
+    if (modelId) await this.r.del(`${this.P}pause:${modelId}`, `${this.P}ovl:${modelId}`);
     if (modelId) {
       await this.r.hdel(`${this.P}cd:${keyId}`, modelId);
       await this.r.del(`${this.P}strike:${keyId}|${modelId}`, `${this.P}probe:${keyId}|${modelId}`);
@@ -576,6 +666,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
 
   /** Bỏ cooldown của 1 model trên mọi key (model bị đổi id / sửa ở tab Limits). */
   async clearModelCooldowns(modelId: string) {
+    await this.r.del(`${this.P}pause:${modelId}`, `${this.P}ovl:${modelId}`);
     const keys = await this.redis.scan('cd:*');
     if (!keys.length) return;
     const pipe = this.r.pipeline();
@@ -639,23 +730,31 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       num(limit.rpd),
       clientId != null && clientLimit != null ? clientId : '',
       num(clientLimit),
+      this.maxInflightPerKey,
       ...keys.flatMap((k) => [k.id, exclude.has(k.id) ? 1 : 0]),
     );
 
     if (res[0] === 0) {
       if (res[1] === 'client_limit')
         return { ok: false, reason: 'client_limit', retryAt: end, detail: [`hết hạn mức ${res[2]}/${clientLimit} request hôm nay`] };
+      if (res[1] === 'paused') {
+        const until = Number(res[2]);
+        return { ok: false, reason: 'paused', retryAt: until, detail: [`Google đang quá tải ${limit.modelId}, tạm nghỉ tới ${new Date(until).toISOString()}`] };
+      }
+      const skipped = (res as [0, 'exhausted', string, [number, string, string][]])[3];
       const retryAt = Number(res[2]);
-      const detail = res[3].map(([idx, kind, v]) => {
+      const busyOnly = skipped.length > 0 && skipped.every(([, kind]) => kind === 'busy');
+      const detail = skipped.map(([idx, kind, v]) => {
         const k = keys[idx];
         const label = `${k.account}/${k.project}`;
         if (kind === 'cooldown') return `${label}: cooldown (${v})`;
         if (kind === 'probe') return `${label}: đang thử dò lại sau 429`;
+        if (kind === 'busy') return `${label}: đang chạy ${v} request cùng lúc`;
         if (kind === 'rpd') return `${label}: hết RPD ${v}/${limit.rpd}`;
         if (kind === 'rpm') return `${label}: hết RPM ${v}/${limit.rpm}`;
         return `${label}: hết TPM ${v}+~${estTokens}/${limit.tpm}`;
       });
-      return { ok: false, reason: 'exhausted', retryAt: retryAt > 0 ? retryAt : null, detail };
+      return { ok: false, reason: 'exhausted', retryAt: retryAt > 0 ? retryAt : null, detail, busyOnly };
     }
 
     const key = keys[res[1]];
@@ -731,6 +830,18 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       m.remainingThisMinute = add(m.remainingThisMinute, nowLeft);
       if (nowLeft === null || nowLeft > 0) m.keys.available++;
     }
+    // model đang tạm nghỉ vì Google quá tải: quota ngày vẫn còn nhưng lúc này không gọi được
+    if (models.length) {
+      const pauses = await this.r.mget(...models.map((m) => `${this.P}pause:${m.modelId}`));
+      pauses.forEach((v, i) => {
+        const until = Number(v || 0);
+        if (until <= now) return;
+        const m = out[i];
+        m.remainingThisMinute = 0;
+        m.keys.available = 0;
+        m.keys.nextAvailableAt = Math.min(m.keys.nextAvailableAt ?? until, until);
+      });
+    }
     return { now, dayStart: start, resetAt: end, clientUsed: used === '' ? null : Number(used), models: out };
   }
 
@@ -761,9 +872,9 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     row.latencyMs = p.latencyMs ?? null;
     if (!row.queued) this.updateQueue.push(row);
 
+    // counted + không có token: script giữ nguyên chỗ và số token ước lượng, chỉ nhả slot "đang chạy" của key
     const counted = p.status === 'ok' || p.status === 'error';
     const ok = p.status === 'ok';
-    if (counted && !ok && p.tokens == null) return; // giữ nguyên chỗ và số token ước lượng
     try {
       await this.scripts.ggFinalize(this.P, f.pair, f.day, logId, counted ? 1 : 0, p.tokens ?? '', row.clientId ?? '', ok ? 1 : 0);
     } catch (e: any) {

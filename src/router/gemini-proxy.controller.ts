@@ -114,6 +114,17 @@ export class GeminiProxyController {
     1,
     Number(process.env.MAX_ATTEMPTS) || 4,
   );
+  /**
+   * Thời gian tối đa cho việc THỬ LẠI của 1 request. Lần gọi đầu tiên không bị giới hạn (để model trả lời dài vẫn
+   * xong), nhưng quá mốc này thì không thử key/model khác nữa và lần thử lại đang chờ bị huỷ, trả lỗi kèm
+   * Retry-After. Đặt thấp hơn timeout phía client để client nhận lỗi rõ ràng thay vì tự timeout.
+   */
+  private readonly deadlineMs = Math.max(
+    100,
+    Number(process.env.ROUTER_DEADLINE_MS) || 45_000,
+  );
+  /** Trong 1 request: số lần 1 model bị Google từ chối vì quá tải trước khi bỏ sang model kế. */
+  private readonly overloadTriesPerModel = 2;
 
   constructor(
     private readonly keys: KeysService,
@@ -517,17 +528,31 @@ export class GeminiProxyController {
       detail: string[];
     }[] = [];
 
+    const deadline = Date.now() + this.deadlineMs;
+    /** sớm nhất khi nào một model bị tạm nghỉ vì quá tải hết nghỉ (gợi ý Retry-After) */
+    let pausedUntil: number | null = null;
+    const notePause = (until: number) => {
+      if (until > Date.now()) pausedUntil = Math.min(pausedUntil ?? until, until);
+    };
+    let deadlineHit = false;
+
     const ctrl = new AbortController();
     res.on("close", () => {
       if (!res.writableFinished) ctrl.abort();
     });
 
     // Mỗi model được thử tối đa maxAttempts key; hết key/quota thì sang model kế (khi gateway tự chọn model).
-    for (const { limit, sendAs: model } of picked.models) {
+    models: for (const { limit, sendAs: model } of picked.models) {
       const exclude = new Set<number>();
       let tries = 0;
+      let overloads = 0;
       let skipModel = false;
       while (tries < this.maxAttempts) {
+        // đã gọi Google ít nhất 1 lần mà quá hạn -> thôi, không thử thêm
+        if (attempts.length > 0 && Date.now() >= deadline) {
+          deadlineHit = true;
+          break models;
+        }
         let r: Awaited<ReturnType<QuotaService["reserve"]>>;
         try {
           r = await this.quota.reserve(
@@ -578,6 +603,13 @@ export class GeminiProxyController {
               ),
             );
           }
+          // key chỉ đang bận (đủ request đồng thời), không hết quota: chờ chút rồi giữ chỗ lại thay vì báo lỗi
+          if (r.reason === "exhausted" && r.busyOnly && Date.now() + 250 < deadline) {
+            await new Promise((ok) => setTimeout(ok, 250));
+            if (ctrl.signal.aborted) return;
+            continue;
+          }
+          if (r.reason === "paused" && r.retryAt) notePause(r.retryAt);
           if (tries === 0)
             exhausted.push({
               limit,
@@ -594,6 +626,11 @@ export class GeminiProxyController {
         exclude.add(key.id);
         const started = Date.now();
 
+        // lần thử lại: chỉ được chờ tới mốc deadline (tính tới lúc Google bắt đầu trả lời)
+        const retryCtl = attempts.length > 0 ? new AbortController() : null;
+        const retryTimer = retryCtl
+          ? setTimeout(() => retryCtl.abort(), Math.max(0, deadline - Date.now()))
+          : null;
         let up: globalThis.Response;
         try {
           up = await fetch(t.url(model), {
@@ -606,16 +643,25 @@ export class GeminiProxyController {
             signal: AbortSignal.any([
               ctrl.signal,
               AbortSignal.timeout(10 * 60_000),
+              ...(retryCtl ? [retryCtl.signal] : []),
             ]),
           });
         } catch (e: any) {
-          const msg = e?.message || String(e);
+          const timedOut = !ctrl.signal.aborted && !!retryCtl?.signal.aborted;
+          const msg = timedOut
+            ? `quá ${Math.round(this.deadlineMs / 1000)}s (ROUTER_DEADLINE_MS) mà Google chưa trả lời lần thử lại`
+            : e?.message || String(e);
           await this.quota.finalize(logId, {
             status: "network_error",
             error: msg,
             latencyMs: Date.now() - started,
           });
           if (ctrl.signal.aborted) return; // client đã huỷ
+          if (timedOut) {
+            attempts.push({ keyId: key.id, status: 0, kind: "deadline" });
+            deadlineHit = true;
+            break models;
+          }
           attempts.push({ keyId: key.id, status: 0, kind: "network" });
           lastFailure = {
             status: 502,
@@ -623,6 +669,8 @@ export class GeminiProxyController {
             contentType: "application/json",
           };
           continue;
+        } finally {
+          if (retryTimer) clearTimeout(retryTimer);
         }
 
         const routeHeaders = {
@@ -670,9 +718,23 @@ export class GeminiProxyController {
             const perDay = ce.quotaIds.some((q) => /PerDay/i.test(q));
             let why = `429 ${ce.quotaIds[0] || "RESOURCE_EXHAUSTED"}`;
             let until: number;
+            // 429 không nói quota nào: có thể là Google quá tải model chứ không phải key hết quota
+            const ovl = ce.quotaIds.length
+              ? null
+              : await this.quota.overload(key.id, limit.modelId);
             if (perDay) {
               until = quotaDayEnd();
               await this.quota.setCooldown(key.id, limit.modelId, until, why);
+            } else if (ovl?.paused) {
+              // nhiều key cùng bị trong vài giây: lỗi của model, không khoá key (để hết nghỉ là dùng lại được ngay)
+              until = ovl.until;
+              why += " (Google quá tải model)";
+              notePause(ovl.until);
+              skipModel = true;
+              if (ovl.justPaused)
+                this.log.warn(
+                  `${limit.modelId}: nhiều key cùng bị 429 -> Google đang quá tải, tạm nghỉ model tới ${new Date(ovl.until).toISOString()}`,
+                );
             } else {
               // Không biết là quota phút hay ngày (Google thường không nói): khoá lâu dần. Quota phút thì phút sau
               // gọi lại được và chuỗi tự xoá; quota ngày đã cạn thì mỗi lần thử lại thất bại khoá gấp đôi, tối đa
@@ -689,10 +751,12 @@ export class GeminiProxyController {
               error: `${why}: ${ce.message}`,
               latencyMs,
             });
-            this.log.warn(
-              `${label} ${limit.modelId}: ${why} -> cooldown tới ${new Date(until).toISOString()}`,
-            );
-            continue;
+            if (!ovl?.paused)
+              this.log.warn(
+                `${label} ${limit.modelId}: ${why} -> cooldown tới ${new Date(until).toISOString()}`,
+              );
+            if (ovl && ++overloads >= this.overloadTriesPerModel) skipModel = true;
+            break;
           }
           case "auth": {
             this.keys.disable(
@@ -725,14 +789,26 @@ export class GeminiProxyController {
             continue;
           }
           case "transient": {
-            // 5xx/overloaded thường là phía model, không phạt key; thử key khác
+            // 5xx/overloaded thường là phía model, không phạt key; thử key khác, nhưng nhiều key cùng bị thì nghỉ model
             await this.quota.finalize(logId, {
               status: "upstream_error",
               httpStatus: up.status,
               error: ce.message,
               latencyMs,
             });
-            continue;
+            if (up.status === 503 || up.status === 429) {
+              const ovl = await this.quota.overload(key.id, limit.modelId);
+              if (ovl.paused) {
+                notePause(ovl.until);
+                skipModel = true;
+                if (ovl.justPaused)
+                  this.log.warn(
+                    `${limit.modelId}: nhiều key cùng bị ${up.status} -> Google đang quá tải, tạm nghỉ model tới ${new Date(ovl.until).toISOString()}`,
+                  );
+              }
+              if (++overloads >= this.overloadTriesPerModel) skipModel = true;
+            }
+            break;
           }
           default: {
             await this.quota.finalize(logId, {
@@ -773,11 +849,20 @@ export class GeminiProxyController {
     }
 
     res.setHeader("x-gg-attempts", String(attempts.length));
-    if (lastFailure)
+    if (deadlineHit) res.setHeader("x-gg-deadline", String(this.deadlineMs));
+    const pauseAfter =
+      pausedUntil != null
+        ? Math.max(1, Math.ceil((pausedUntil - Date.now()) / 1000))
+        : null;
+    if (lastFailure) {
+      const retryable = lastFailure.status === 429 || lastFailure.status >= 500;
+      if (retryable && (pauseAfter || deadlineHit))
+        res.setHeader("Retry-After", String(pauseAfter ?? 5));
       return res
         .status(lastFailure.status)
         .type(lastFailure.contentType)
         .send(lastFailure.body);
+    }
     if (exhausted.length) {
       const times = exhausted
         .map((e) => e.retryAt)
@@ -787,14 +872,18 @@ export class GeminiProxyController {
         : null;
       if (retryAfter) res.setHeader("Retry-After", String(retryAfter));
       const names = exhausted.map((e) => e.limit.displayName).join(", ");
-      return res.status(429).json(
+      const allPaused = exhausted.every((e) => e.reason === "paused");
+      return res.status(allPaused ? 503 : 429).json(
         errBody(
           t.fmt,
-          429,
-          "RESOURCE_EXHAUSTED",
+          allPaused ? 503 : 429,
+          allPaused ? "UNAVAILABLE" : "RESOURCE_EXHAUSTED",
           exhausted.every((e) => e.reason === "no_keys")
             ? "Chưa có API key nào đang bật"
-            : `Tất cả key đã hết quota local cho ${names}` +
+            : allPaused
+              ? `Google đang quá tải ${names} (nhiều key cùng bị từ chối), gateway tạm nghỉ` +
+                (retryAfter ? ` — thử lại sau ~${retryAfter}s` : "")
+              : `Tất cả key đã hết quota local cho ${names}` +
                 (retryAfter ? ` — thử lại sau ~${retryAfter}s` : ""),
           {
             router: {
