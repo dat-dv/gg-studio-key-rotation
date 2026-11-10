@@ -46,7 +46,10 @@ function renderSnippet(box, sn, onClose) {
     <div class="row" style="margin-top:8px"><input data-s="base" style="max-width:420px" spellcheck="false" /><span class="hint" data-s="hint"></span></div>
     <div class="hint" style="margin-top:8px" data-s="note"></div>
     <pre data-s="curl"></pre>
-    <div class="row" style="margin-top:8px"><button class="btn sm" data-s="copy">Copy curl</button><button class="btn sm" data-s="close">Đóng</button></div>`;
+    <div class="row" style="margin-top:8px"><button class="btn sm" data-s="copy">Copy curl</button><button class="btn sm" data-s="close">Đóng</button></div>
+    <div class="hint" style="margin-top:12px">Xem số request còn lại của key này (không tốn quota). Response thành công cũng có header <code>x-gg-client-remaining-requests</code> khi key có hạn mức riêng.</div>
+    <pre data-s="quota"></pre>
+    <div class="row" style="margin-top:8px"><button class="btn sm" data-s="copyQuota">Copy curl quota</button></div>`;
   const q = (n) => box.querySelector(`[data-s="${n}"]`);
   const curMode = () => box.querySelector(`input[name=${radio}]:checked`).value;
   let fmtChoice = 'openai';
@@ -59,6 +62,7 @@ function renderSnippet(box, sn, onClose) {
     q('fmt').value = nativeOnly ? 'gemini' : fmtChoice; // model chỉ-native: ép Gemini, đổi lại model khác thì trả về lựa chọn cũ
     q('note').innerHTML = `Loại model: <b>${esc(CAPS[cap].label)}</b> — ${esc(CAPS[cap].how)}${nativeOnly ? '' : ` · Base URL cho OpenAI SDK: <code>${esc(base)}/v1</code>`}`;
     q('curl').textContent = curlText(base, sn.token || '<CLIENT_KEY>', model, q('fmt').value, cap);
+    q('quota').textContent = `curl "${base}/v1/quota?model=${model}" \\\n  -H "Authorization: Bearer ${sn.token || '<CLIENT_KEY>'}"`;
   };
   const setMode = (m) => {
     lsSet('snippetMode', m);
@@ -71,6 +75,7 @@ function renderSnippet(box, sn, onClose) {
   q('model').onchange = update;
   q('fmt').onchange = () => { fmtChoice = q('fmt').value; update(); };
   q('copy').onclick = async () => { await navigator.clipboard.writeText(q('curl').textContent); toast('Đã copy curl'); };
+  q('copyQuota').onclick = async () => { await navigator.clipboard.writeText(q('quota').textContent); toast('Đã copy curl'); };
   q('close').onclick = onClose;
   const copyToken = box.querySelector('[data-s="copyToken"]');
   if (copyToken) copyToken.onclick = async () => { await navigator.clipboard.writeText(sn.token); toast('Đã copy key'); };

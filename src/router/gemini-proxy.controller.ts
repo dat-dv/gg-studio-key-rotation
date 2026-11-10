@@ -37,6 +37,25 @@ function estimateTokens(body: unknown): number {
   return Math.ceil(chars / 4) + media * 258;
 }
 
+/** Header báo hạn mức còn lại của client key (chỉ khi key có hạn mức request/ngày). */
+function clientQuotaHeaders(
+  dailyLimit: number | null,
+  used: number | null,
+): Record<string, string> {
+  if (dailyLimit == null || used == null) return {};
+  const remaining = String(Math.max(0, dailyLimit - used));
+  const reset = `${Math.max(1, Math.ceil((quotaDayEnd() - Date.now()) / 1000))}s`;
+  return {
+    "x-gg-client-limit-requests": String(dailyLimit),
+    "x-gg-client-remaining-requests": remaining,
+    "x-gg-client-reset-requests": reset,
+    // cùng tên với header của OpenAI để SDK / client có sẵn đọc được; số là của client key, không phải của model
+    "x-ratelimit-limit-requests": String(dailyLimit),
+    "x-ratelimit-remaining-requests": remaining,
+    "x-ratelimit-reset-requests": reset,
+  };
+}
+
 function lastTotalTokens(text: string): number | null {
   const all = [
     ...text.matchAll(/"(?:totalTokenCount|total_tokens)"\s*:\s*(\d+)/g),
@@ -212,6 +231,118 @@ export class GeminiProxyController {
       `${this.base}/v1beta/openai/models`,
       (k) => ({ authorization: `Bearer ${k}` }),
     );
+  }
+
+  /**
+   * Quota còn lại cho chính client key đang gọi: hạn mức riêng của key + quota của từng model key được phép dùng
+   * trên toàn pool. Chỉ đọc, không tốn quota. ?model=<id> để hỏi 1 model.
+   */
+  @Get(["v1/quota", "openai/v1/quota"])
+  async clientQuota(@Req() req: Request, @Res() res: Response) {
+    const client = this.auth(req, res, "openai");
+    if (!client) return;
+    const allowed = client.allowedModels ? new Set(client.allowedModels) : null;
+    let models = this.limits
+      .list()
+      .filter((l) => !allowed || allowed.has(l.modelId));
+    const want =
+      typeof req.query.model === "string"
+        ? req.query.model.replace(/^models\//, "")
+        : "";
+    if (want) {
+      const l = this.limits.resolve(want);
+      if (!l)
+        return res
+          .status(404)
+          .json(
+            errBody("openai", 404, "NOT_FOUND", `Model "${want}" chưa có trong bảng limits`),
+          );
+      if (allowed && !allowed.has(l.modelId))
+        return res
+          .status(403)
+          .json(
+            errBody(
+              "openai",
+              403,
+              "PERMISSION_DENIED",
+              `Key "${client.name}" không được phép dùng model "${want}". Xem GET /v1/models.`,
+            ),
+          );
+      models = [l];
+    }
+
+    const limited = client.id != null && client.dailyLimit != null;
+    let q: Awaited<ReturnType<QuotaService["remaining"]>>;
+    try {
+      q = await this.quota.remaining(models, limited ? client.id : null);
+    } catch (e: any) {
+      this.log.error(`Redis lỗi khi đọc quota: ${e?.message || e}`);
+      res.setHeader("Retry-After", "5");
+      return res
+        .status(503)
+        .json(
+          errBody(
+            "openai",
+            503,
+            "UNAVAILABLE",
+            "Gateway tạm thời không đọc được bộ đếm quota (Redis). Thử lại sau vài giây.",
+          ),
+        );
+    }
+
+    const usedToday =
+      client.id == null
+        ? null
+        : (q.clientUsed ?? this.quota.clientRequestsToday(client.id));
+    const clientRemaining =
+      client.dailyLimit == null
+        ? null
+        : Math.max(0, client.dailyLimit - (usedToday ?? 0));
+    // gọi bằng tên không có trong bảng (vd "auto"): gateway thử lần lượt các model chat được phép
+    let pool: number | null = 0;
+    for (const m of q.models)
+      if (
+        !m.unavailableReason &&
+        !capabilityMismatch(m.limit.capability, "openai-chat", m.limit.modelId)
+      )
+        pool =
+          pool === null || m.remainingToday === null
+            ? null
+            : pool + m.remainingToday;
+    const autoRemainingToday =
+      clientRemaining === null
+        ? pool
+        : pool === null
+          ? clientRemaining
+          : Math.min(clientRemaining, pool);
+    const iso = (t: number | null) => (t == null ? null : new Date(t).toISOString());
+
+    res.set(clientQuotaHeaders(client.dailyLimit, usedToday));
+    return res.json({
+      object: "quota",
+      // số gateway tự đếm: request gọi thẳng Google bằng cùng key thì không thấy
+      estimated: true,
+      resetAt: iso(q.resetAt),
+      resetInSeconds: Math.max(0, Math.ceil((q.resetAt - q.now) / 1000)),
+      client: {
+        name: client.name,
+        dailyLimit: client.dailyLimit,
+        usedToday,
+        remainingToday: clientRemaining,
+      },
+      autoRemainingToday,
+      models: q.models.map((m) => ({
+        model: m.limit.modelId,
+        displayName: m.limit.displayName,
+        capability: m.limit.capability,
+        limit: { rpm: m.limit.rpm, tpm: m.limit.tpm, rpd: m.limit.rpd },
+        usedToday: m.usedToday,
+        remainingToday: m.unavailableReason ? 0 : m.remainingToday,
+        remainingThisMinute: m.unavailableReason ? 0 : m.remainingThisMinute,
+        unavailableReason: m.unavailableReason,
+        keys: { ...m.keys, nextAvailableAt: iso(m.keys.nextAvailableAt) },
+      })),
+    });
   }
 
   // ---------- Gemini native ----------
@@ -431,6 +562,7 @@ export class GeminiProxyController {
             );
             res.setHeader("Retry-After", String(retryAfter));
             res.setHeader("x-gg-attempts", String(attempts.length));
+            res.set(clientQuotaHeaders(client.dailyLimit, client.dailyLimit));
             return res.status(429).json(
               errBody(
                 t.fmt,
@@ -458,6 +590,7 @@ export class GeminiProxyController {
         tries++;
 
         const { key, logId } = r;
+        const quotaHeaders = clientQuotaHeaders(client.dailyLimit, r.clientUsed);
         exclude.add(key.id);
         const started = Date.now();
 
@@ -498,6 +631,7 @@ export class GeminiProxyController {
           "x-gg-project": encodeURIComponent(key.project),
           "x-gg-attempts": String(attempts.length + 1),
           "x-gg-model": limit.modelId,
+          ...quotaHeaders,
         };
 
         if (up.ok) {
@@ -624,7 +758,9 @@ export class GeminiProxyController {
               skipModel = true;
               break;
             }
-            // 400/404...: lỗi request của client -> không failover, trả nguyên lỗi
+            // 400/404...: lỗi request của client -> không failover, trả nguyên lỗi.
+            // Request này không tính quota (đã trả lại chỗ) nên không gửi số còn lại vừa đọc lúc giữ chỗ.
+            for (const h of Object.keys(quotaHeaders)) delete (routeHeaders as Record<string, string>)[h];
             res.set(routeHeaders);
             return res
               .status(up.status)
