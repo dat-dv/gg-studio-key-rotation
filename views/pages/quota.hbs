@@ -4,6 +4,7 @@
     <div style="min-width:280px;flex:1;max-width:420px"><select id="quotaKey"></select></div>
     <label class="row" style="margin:0;color:var(--text)"><input type="checkbox" id="hideZero" checked style="width:auto" /> Ẩn model chưa dùng được</label>
     <div class="spacer"></div>
+    <button class="btn sm" id="syncRedis" title="Dựng lại bộ đếm trong Redis từ log request và bỏ các cooldown gateway tự suy ra. Cooldown hết quota ngày (Google báo rõ) được giữ.">Sync Redis</button>
     <span class="hint" id="resetIn"></span>
   </div>
   <div class="tablewrap"><table>

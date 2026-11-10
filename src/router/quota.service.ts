@@ -594,10 +594,12 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   /**
    * Gọi sau khi DB bị sửa từ bên ngoài (import backup): ghi hết hàng đợi log, xoá bộ đếm trong Redis rồi dựng lại
    * từ request_log. Cooldown trong Redis giữ nguyên trừ khi wipeCooldowns (import kiểu replace).
+   * keepInflight: DB không đổi (nút Sync) nên request đang chạy vẫn được chốt bình thường khi xong; dòng 'pending'
+   * của nó đã được tính lúc dựng lại nên việc chốt (giữ chỗ / trả chỗ) vẫn khớp.
    */
-  async resetCounters(wipeCooldowns = false) {
+  async resetCounters(wipeCooldowns = false, keepInflight = false) {
     this.flush();
-    this.inflight.clear();
+    if (!keepInflight) this.inflight.clear();
     const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
@@ -606,6 +608,37 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     this.syncLogId();
     await this.seedFromDb();
     await this.migrateLegacyCooldowns();
+  }
+
+  /**
+   * Nút Sync trên trang Quota: đưa Redis về đúng với những gì chắc chắn biết.
+   *  - bộ đếm RPM/TPM/RPD và hạn mức client: xoá rồi dựng lại từ request_log
+   *  - cooldown: chỉ giữ loại Google nói rõ là hết quota NGÀY (quotaId có "PerDay", tự hết lúc reset quota);
+   *    mọi cooldown gateway tự suy ra (429 không rõ quota khoá lâu dần, 403, 404 kiểu cũ) đều bỏ
+   *  - chuỗi 429 liên tiếp, lượt thử dò, tạm nghỉ model vì quá tải, khoá model 404: bỏ hết
+   * Bỏ nhầm cũng không sao: request sau bị Google từ chối thì gateway đặt lại.
+   */
+  async sync() {
+    await this.resetCounters(false, true);
+    let cooldownsRemoved = 0;
+    let cooldownsKept = 0;
+    for (const k of await this.redis.scan('cd:*')) {
+      const drop: string[] = [];
+      for (const [modelId, v] of Object.entries(await this.r.hgetall(k))) {
+        if (/PerDay/i.test(v.slice(v.indexOf('|') + 1))) cooldownsKept++;
+        else drop.push(modelId);
+      }
+      if (drop.length) await this.r.hdel(k, ...drop);
+      cooldownsRemoved += drop.length;
+    }
+    const modelBlocksRemoved = (await this.redis.scan('gone:*')).length;
+    for (const p of ['strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*']) {
+      const keys = await this.redis.scan(p);
+      for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
+    }
+    const pairs = await this.r.scard(`${this.P}pairs:${this.day(Date.now()).start}`);
+    this.log.log(`Sync Redis: ${pairs} cặp key+model, bỏ ${cooldownsRemoved} cooldown, giữ ${cooldownsKept} (hết quota ngày), bỏ khoá ${modelBlocksRemoved} model`);
+    return { pairs, cooldownsRemoved, cooldownsKept, modelBlocksRemoved };
   }
 
   // ---------------------------------------------------------------- cooldown

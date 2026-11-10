@@ -1,4 +1,4 @@
-import { Controller, Delete, Get, Param, ParseIntPipe, Query, UseGuards } from '@nestjs/common';
+import { Controller, Delete, Get, HttpCode, Param, ParseIntPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { AdminGuard } from '../common/token.guard';
 import { KeysService } from '../keys/keys.service';
 import { LimitsService } from '../limits/limits.service';
@@ -31,6 +31,13 @@ export class UsageController {
   @Get('logs')
   logs(@Query('page') page?: string, @Query('pageSize') pageSize?: string) {
     return this.quota.logs(Number(page) || 1, Number(pageSize) || 50);
+  }
+
+  /** Dựng lại bộ đếm Redis từ request_log và bỏ các cooldown gateway tự suy ra (nút Sync ở trang Quota). */
+  @Post('sync')
+  @HttpCode(200)
+  async sync() {
+    return { ok: true, ...(await this.quota.sync()) };
   }
 
   /** Bỏ khoá model bị Google trả 404 để gateway thử lại ngay. */

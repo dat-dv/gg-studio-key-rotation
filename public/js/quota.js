@@ -47,6 +47,16 @@ function renderQuota() {
 }
 $('#quotaKey').onchange = renderQuota;
 $('#hideZero').onchange = renderQuota;
+$('#syncRedis').onclick = async () => {
+  if (!confirm('Sync Redis?\n\n• Dựng lại bộ đếm RPM/TPM/RPD từ log request\n• Bỏ mọi cooldown gateway tự suy ra (429 không rõ quota, 403, model 404, tạm nghỉ model)\n• Giữ cooldown hết quota ngày mà Google báo rõ\n\nNếu key thật sự còn bị giới hạn, request kế tiếp sẽ bị Google từ chối và cooldown được đặt lại.')) return;
+  const btn = $('#syncRedis');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/sync', { method: 'POST' });
+    toast(`Đã sync: bỏ ${r.cooldownsRemoved} cooldown, giữ ${r.cooldownsKept} (hết quota ngày), bỏ khoá ${r.modelBlocksRemoved} model`);
+    refresh();
+  } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+};
 async function unblockModel(modelId) { await api(`/api/model-blocks/${encodeURIComponent(modelId)}`, { method: 'DELETE' }); refresh(); }
 async function clearCdModel(keyId, modelId) { await api(`/api/cooldowns/${keyId}/${encodeURIComponent(modelId)}`, { method: 'DELETE' }); refresh(); }
 
