@@ -497,7 +497,7 @@ $('#reloadLogs').onclick = loadLogs;
 let clients = [];
 let editingClient = null;
 let openClient = null; // id của key đang mở hàng chi tiết
-const freshTokens = new Map(); // id -> key đầy đủ vừa tạo, chỉ giữ trong RAM của tab này
+const shownTokens = new Map(); // id -> key đầy đủ đang hiện (vừa tạo hoặc đã bấm Hiện), chỉ giữ trong RAM của tab này
 const usableLimits = () => state.limits.filter((l) => !l.unavailableReason);
 function renderClientModels(selected = []) {
   const sel = new Set(selected);
@@ -555,7 +555,7 @@ $('#clientSave').onclick = async () => {
       toast('Đã lưu');
     } else {
       const r = await api('/api/clients', { method: 'POST', body });
-      freshTokens.set(r.id, r.token);
+      shownTokens.set(r.id, r.token);
       showCreated(r);
     }
     resetClientForm();
@@ -639,16 +639,17 @@ function renderSnippet(box, sn, onClose) {
   const copyToken = box.querySelector('[data-s="copyToken"]');
   if (copyToken) copyToken.onclick = async () => { await navigator.clipboard.writeText(sn.token); toast('Đã copy key'); };
   setMode(mode);
+  return { setToken: (t) => { sn.token = t; update(); } };
 }
 const snippetModels = (allowed) => (allowed.length ? allowed : usableLimits().map((l) => l.modelId));
-/** Khối hiện ngay sau khi tạo key: key đầy đủ (một lần) + lệnh mẫu. */
+/** Khối hiện ngay sau khi tạo key: key đầy đủ + lệnh mẫu. */
 function showCreated(r) {
   const box = $('#clientToken');
   box.hidden = false;
   renderSnippet(box, {
     token: r.token,
     models: snippetModels(r.allowedModels),
-    head: `<b class="ok">Đã tạo key cho "${esc(r.name)}"</b> — key chỉ hiện <b>một lần</b>, hãy copy ngay.
+    head: `<b class="ok">Đã tạo key cho "${esc(r.name)}"</b> — copy key bên dưới; sau này bấm vào key trong bảng để xem lại.
       <div class="row" style="margin-top:8px"><code style="font-size:13px;padding:4px 8px">${esc(r.token)}</code><button class="btn sm" data-s="copyToken">Copy key</button></div>`,
   }, () => { box.hidden = true; });
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -662,7 +663,7 @@ function toggleClientDetail(id, scroll = true) {
   const row = document.querySelector(`#clientsBody tr[data-client="${id}"]`);
   if (!c || !row) { openClient = null; return; }
   openClient = id;
-  const token = freshTokens.get(id) || null;
+  const token = shownTokens.get(id) || null;
   const when = (ts) => (ts ? new Date(ts).toLocaleString() : null);
   const modelList = c.allowedModels.length
     ? c.allowedModels.map((m) => `<code>${esc(m)}</code> <span class="hint">${esc(CAPS[capOf(m)].label)}</span>`).join(' · ')
@@ -676,9 +677,9 @@ function toggleClientDetail(id, scroll = true) {
       <div><span>Tạo lúc</span>${esc(when(c.createdAt) || '—')}</div>
       <div><span>Dùng lần cuối</span>${esc(when(c.lastUsedAt) || 'chưa dùng')}</div>
       <div><span>Hôm nay</span>${c.requestsToday} request · ${fmt(c.tokensToday)} token</div>
-      <div><span>Key</span><code>${esc(c.tokenPrefix)}…</code> <div class="hint">${token
-        ? 'Key vừa tạo: lệnh mẫu bên dưới đang dùng key đầy đủ (mất khi tải lại trang).'
-        : 'Server chỉ lưu hash nên không xem lại được key đầy đủ. Thay <code>&lt;CLIENT_KEY&gt;</code> trong lệnh mẫu bằng key đã cấp.'}</div></div>
+      <div class="wide"><span>Key</span>${c.revealable
+        ? `<div class="row"><code data-k="tok" style="font-size:13px;padding:4px 8px;word-break:break-all"></code><button class="btn sm" data-k="show"></button><button class="btn sm" data-k="copy">Copy key</button></div>`
+        : `<code>${esc(c.tokenPrefix)}…</code> <div class="hint">Key này tạo từ bản cũ, server chỉ có mã băm nên không xem lại được. Thay <code>&lt;CLIENT_KEY&gt;</code> trong lệnh mẫu bằng key đã cấp, hoặc tạo key mới để thay.</div>`}</div>
       <div class="wide"><span>Model được phép</span>${modelList}</div>
       <div class="wide"><span>Cách gửi key</span><code>Authorization: Bearer &lt;key&gt;</code> · <code>x-goog-api-key: &lt;key&gt;</code> · <code>?key=&lt;key&gt;</code></div>
     </div>
@@ -686,7 +687,26 @@ function toggleClientDetail(id, scroll = true) {
     <div class="snip"></div></td>`;
   row.after(tr);
   row.classList.add('open');
-  renderSnippet(tr.querySelector('.snip'), { token, models: snippetModels(c.allowedModels) }, () => toggleClientDetail(id));
+  const snip = renderSnippet(tr.querySelector('.snip'), { token, models: snippetModels(c.allowedModels) }, () => toggleClientDetail(id));
+  if (c.revealable) {
+    const k = (n) => tr.querySelector(`[data-k="${n}"]`);
+    const fetchToken = async () => shownTokens.get(id) || (await api(`/api/clients/${id}/reveal`)).token;
+    const paint = () => { // key đang hiện thì điền luôn vào lệnh mẫu
+      const t = shownTokens.get(id) || null;
+      k('tok').textContent = t || c.tokenPrefix + '…';
+      k('show').textContent = t ? 'Ẩn' : 'Hiện';
+      snip.setToken(t);
+    };
+    k('show').onclick = async () => {
+      try {
+        if (shownTokens.has(id)) shownTokens.delete(id);
+        else shownTokens.set(id, await fetchToken());
+        paint();
+      } catch (e) { toast(e.message); }
+    };
+    k('copy').onclick = async () => { try { await navigator.clipboard.writeText(await fetchToken()); toast('Đã copy key'); } catch (e) { toast(e.message); } };
+    paint();
+  }
   if (scroll) tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
