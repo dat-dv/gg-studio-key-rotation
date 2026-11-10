@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../db/database.service';
 import { DEFAULT_LIMITS_RAW } from './default-limits';
-import { normalizeModelId, parseLimitsTable, ParsedLimit } from './limits-parser';
+import { normalizeModelId, parseLimitsTable, ParsedLimit, unusableReason } from './limits-parser';
 
 export interface ModelLimit {
   modelId: string;
@@ -92,17 +92,28 @@ export class LimitsService implements OnModuleInit {
         sort_order=excluded.sort_order, updated_at=excluded.updated_at`);
   }
 
+  /**
+   * Chỉ nạp những model gateway dùng được (limit khác 0, không thuộc nhóm Agents / Live API).
+   * Dòng không dùng được mà đang có trong bảng thì bị gỡ ra. Lịch sử usage (request_log) không bị đụng tới.
+   */
   import(raw: string, mode: 'merge' | 'replace' = 'merge') {
     const parsed = parseLimitsTable(raw || '');
     if (!parsed.length) throw new BadRequestException('Không parse được dòng model nào từ nội dung đã paste');
+    const usable = parsed.filter((p) => !unusableReason(p)).map((p, i) => ({ ...p, sortOrder: i }));
+    const skipped = parsed
+      .filter((p) => unusableReason(p))
+      .map((p) => ({ modelId: p.modelId, displayName: p.displayName, reason: unusableReason(p)! }));
     const stmt = this.upsertStmt();
-    this.db.transaction((items: ParsedLimit[]) => {
+    const del = this.db.prepare('DELETE FROM model_limits WHERE model_id = ?');
+    let removed = 0;
+    this.db.transaction(() => {
       if (mode === 'replace') this.db.prepare('DELETE FROM model_limits').run();
       const now = Date.now();
-      for (const p of items) stmt.run({ ...p, aliases: p.aliases.join(','), now });
-    })(parsed);
+      for (const p of usable) stmt.run({ ...p, aliases: p.aliases.join(','), now });
+      for (const p of skipped) removed += del.run(p.modelId).changes;
+    })();
     this.cache = null;
-    return { imported: parsed.length, mode };
+    return { imported: usable.length, skipped, removed, mode };
   }
 
   update(modelId: string, dto: Partial<Omit<ModelLimit, 'modelId'>> & { newModelId?: string }) {

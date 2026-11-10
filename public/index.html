@@ -166,7 +166,7 @@
       <div class="row" style="margin-top:8px">
         <button class="btn primary" id="importMerge">Import (merge)</button>
         <button class="btn danger" id="importReplace">Import (thay toàn bộ)</button>
-        <span class="hint">Chỉ lấy limit (số bên phải dấu /). Phần Tools bị bỏ qua. Trống = Unlimited, 0 = không có free tier.</span>
+        <span class="hint">Chỉ nạp model dùng được qua gateway: bỏ qua model limit 0, nhóm Agents, Live API và phần Tools. Usage đã ghi không bị xoá.</span>
       </div>
     </div>
     <div class="card">
@@ -417,7 +417,7 @@ $('#addLimit').onclick = async () => {
 };
 async function importLimits(mode) {
   if (mode === 'replace' && !confirm('Thay toàn bộ bảng limit? Alias đã sửa tay sẽ mất.')) return;
-  try { const r = await api('/api/limits/import', { method: 'POST', body: JSON.stringify({ raw: $('#limitsRaw').value, mode }) }); toast(`Đã import ${r.imported} model`); $('#limitsRaw').value = ''; await refresh(); renderLimits(); } catch (e) { toast(e.message); }
+  try { const r = await api('/api/limits/import', { method: 'POST', body: JSON.stringify({ raw: $('#limitsRaw').value, mode }) }); toast(`Đã import ${r.imported} model dùng được, bỏ qua ${r.skipped.length} model không dùng được` + (r.removed ? `, gỡ ${r.removed} model cũ khỏi bảng` : '')); $('#limitsRaw').value = ''; await refresh(); renderLimits(); } catch (e) { toast(e.message); }
 }
 $('#importMerge').onclick = () => importLimits('merge');
 $('#importReplace').onclick = () => importLimits('replace');

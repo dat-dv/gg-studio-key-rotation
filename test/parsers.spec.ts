@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { quotaDayEnd, quotaDayStart } from '../src/common/time';
 import { maskKey, parseCurl } from '../src/keys/curl-parser';
 import { DEFAULT_LIMITS_RAW } from '../src/limits/default-limits';
-import { normalizeModelId, parseLimitsTable, parseQuotaNumber } from '../src/limits/limits-parser';
+import { normalizeModelId, parseLimitsTable, parseQuotaNumber, unusableReason } from '../src/limits/limits-parser';
 import { classifyUpstreamError } from '../src/router/upstream-error';
 
 test('parseCurl: header x-goog-api-key, multi-line', () => {
@@ -43,6 +43,16 @@ test('parseLimitsTable: seed + dạng mỗi ô 1 dòng như copy từ AI Studio'
   const rows = parseLimitsTable(pasted);
   assert.equal(rows.length, 2);
   assert.deepEqual([rows[1].modelId, rows[1].rpm, rows[1].tpm, rows[1].rpd], ['gemma-4-26b', 30, 16000, 14400]);
+});
+
+test('unusableReason: chỉ giữ model gateway dùng được', () => {
+  const all = parseLimitsTable(DEFAULT_LIMITS_RAW);
+  const usable = all.filter((l) => !unusableReason(l)).map((l) => l.modelId);
+  assert.equal(usable.length, 16);
+  for (const id of ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemma-4-31b', 'gemini-embedding-1', 'gemini-2.5-flash-tts'])
+    assert.ok(usable.includes(id), id);
+  for (const id of ['antigravity', 'gemini-2.5-pro', 'gemini-3.8-live', 'gemini-3.5-transcribe', 'lyria-3-pro'])
+    assert.ok(!usable.includes(id), id);
 });
 
 test('normalizeModelId', () => {

@@ -112,7 +112,7 @@ Paste lệnh curl lấy từ AI Studio (hoặc chỉ API key), điền account v
 
 ### 2. Cập nhật bảng limit (tab **Limits**)
 
-Copy nguyên bảng Rate limits trên AI Studio, paste vào ô import. Usage không bị ảnh hưởng. Cột alias dùng để khớp tên model client gửi lên (ví dụ `gemini-flash-latest`).
+Copy nguyên bảng Rate limits trên AI Studio, paste vào ô import. Chỉ những model dùng được qua gateway mới được nạp: bỏ qua model có limit 0, nhóm Agents (cần Interactions API) và Live API (WebSocket). Usage không bị ảnh hưởng. Cột alias dùng để khớp tên model client gửi lên (ví dụ `gemini-flash-latest`).
 
 ### 3. Cấp key cho nơi dùng (tab **Client keys**)
 

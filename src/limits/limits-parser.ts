@@ -24,6 +24,16 @@ const KNOWN_ALIASES: Record<string, string[]> = {
   'Gemini 2.5 Flash Native Audio Dialog': ['gemini-2.5-flash-native-audio'],
 };
 
+/** Nhóm model gateway không phục vụ được: Agents cần Interactions API, Live API chạy qua WebSocket. */
+const UNSUPPORTED_CATEGORIES = new Set(['agents', 'live api']);
+
+/** Vì sao 1 dòng trong bảng AI Studio không dùng được qua gateway; null = dùng được. */
+export function unusableReason(l: Pick<ParsedLimit, 'category' | 'rpm' | 'tpm' | 'rpd'>): string | null {
+  if (l.rpm === 0 || l.tpm === 0 || l.rpd === 0) return 'không có free tier (limit 0)';
+  if (UNSUPPORTED_CATEGORIES.has(l.category.trim().toLowerCase())) return `nhóm "${l.category}" gateway chưa hỗ trợ`;
+  return null;
+}
+
 export function parseQuotaNumber(v: string): number | null {
   const s = v.trim();
   if (!s || s === '-' || /^unlimited$/i.test(s)) return null;
