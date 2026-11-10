@@ -56,13 +56,25 @@ function clientQuota(c) {
       keys: pool.length,
     };
   });
-  const left = rows.some((r) => r.left == null) ? null : rows.reduce((s, r) => s + r.left, 0);
-  return { rows, left };
+  const poolLeft = rows.some((r) => r.left == null) ? null : rows.reduce((s, r) => s + r.left, 0);
+  // hạn mức riêng của key (request/ngày, tính chung mọi model); null = không đặt
+  const ownLeft = c.dailyLimit == null ? null : Math.max(0, c.dailyLimit - c.requestsToday);
+  const left = ownLeft == null ? poolLeft : poolLeft == null ? ownLeft : Math.min(ownLeft, poolLeft);
+  return { rows, poolLeft, ownLeft, left };
 }
 function quotaCell(c) {
   const q = clientQuota(c);
   const cls = q.left === 0 ? 'bad' : 'ok';
-  return `<span class="badge ${cls}">${q.left == null ? 'Không giới hạn' : fmt(q.left) + ' req'}</span> <span class="hint">${q.rows.length} model</span>`;
+  const why = c.dailyLimit == null ? `theo pool · ${q.rows.length} model`
+    : q.ownLeft === q.left ? `hạn mức ${fmt(c.requestsToday)} / ${fmt(c.dailyLimit)}`
+    : `pool sắp hết · hạn mức ${fmt(c.requestsToday)} / ${fmt(c.dailyLimit)}`;
+  return `<span class="badge ${cls}">${q.left == null ? 'Không giới hạn' : fmt(q.left) + ' req'}</span> <span class="hint">${why}</span>`;
+}
+/** Dòng "Hạn mức riêng" trong hàng chi tiết. */
+function ownLimitHtml(c) {
+  if (c.dailyLimit == null) return '<span class="hint">Không đặt — key này gọi được tới khi pool hết quota. Bấm Sửa để đặt hạn mức.</span>';
+  const left = Math.max(0, c.dailyLimit - c.requestsToday);
+  return `<div style="max-width:260px">${meter(c.requestsToday, c.dailyLimit)}</div><span class="hint">${left ? `còn ${fmt(left)} request hôm nay` : 'đã hết: request bị từ chối (429) tới khi reset 00:00 PT'}</span>`;
 }
 function quotaTable(c) {
   const { rows } = clientQuota(c);
@@ -89,6 +101,8 @@ function paintClientQuota() {
   const open = clients.find((c) => c.id === openClient);
   const box = document.querySelector('#clientsBody tr.detail [data-k="quota"]');
   if (open && box) box.innerHTML = quotaTable(open);
+  const own = document.querySelector('#clientsBody tr.detail [data-k="own"]');
+  if (open && own) own.innerHTML = ownLimitHtml(open);
 }
 /** Gọi mỗi lần dashboard làm mới (5s) khi đang ở tab này. */
 async function refreshClientQuota() {
@@ -124,6 +138,7 @@ async function loadClients() {
 function resetClientForm() {
   editingClient = null;
   $('#clientName').value = '';
+  $('#clientLimit').value = '';
   $('#clientFormTitle').textContent = 'Tạo key cho nơi khác gọi vào gateway';
   $('#clientSave').textContent = 'Tạo key';
   $('#clientCancel').hidden = true;
@@ -133,6 +148,7 @@ function editClient(id) {
   const c = clients.find((x) => x.id === id);
   editingClient = id;
   $('#clientName').value = c.name;
+  $('#clientLimit').value = c.dailyLimit ?? '';
   $('#clientFormTitle').textContent = `Sửa key "${c.name}"`;
   $('#clientSave').textContent = 'Lưu thay đổi';
   $('#clientCancel').hidden = false;
@@ -142,7 +158,8 @@ function editClient(id) {
 }
 $('#clientCancel').onclick = resetClientForm;
 $('#clientSave').onclick = async () => {
-  const body = JSON.stringify({ name: $('#clientName').value, allowedModels: checkedModels() });
+  const limit = $('#clientLimit').value.trim();
+  const body = JSON.stringify({ name: $('#clientName').value, allowedModels: checkedModels(), dailyLimit: limit === '' ? null : Number(limit) });
   try {
     if (editingClient) {
       await api(`/api/clients/${editingClient}`, { method: 'PATCH', body });
@@ -192,13 +209,14 @@ function toggleClientDetail(id, scroll = true) {
       <div><span>Tạo lúc</span>${esc(when(c.createdAt) || '—')}</div>
       <div><span>Dùng lần cuối</span>${esc(when(c.lastUsedAt) || 'chưa dùng')}</div>
       <div><span>Hôm nay</span>${c.requestsToday} request · ${fmt(c.tokensToday)} token</div>
+      <div class="wide"><span>Hạn mức riêng (request / ngày)</span><div data-k="own">${ownLimitHtml(c)}</div></div>
       <div class="wide"><span>Key</span>${c.revealable
         ? `<div class="row"><code data-k="tok" style="font-size:13px;padding:4px 8px;word-break:break-all"></code><button class="btn sm" data-k="show"></button><button class="btn sm" data-k="copy">Copy key</button></div>`
         : `<code>${esc(c.tokenPrefix)}…</code> <div class="hint">Key này tạo từ bản cũ, server chỉ có mã băm nên không xem lại được. Thay <code>&lt;CLIENT_KEY&gt;</code> trong lệnh mẫu bằng key đã cấp, hoặc tạo key mới để thay.</div>`}</div>
       <div class="wide"><span>Model được phép</span>${modelList}</div>
       <div class="wide"><span>Cách gửi key</span><code>Authorization: Bearer &lt;key&gt;</code> · <code>x-goog-api-key: &lt;key&gt;</code> · <code>?key=&lt;key&gt;</code></div>
     </div>
-    <b>Giới hạn hôm nay</b> <span class="hint">— client key không có hạn mức riêng: số còn lại là của pool key Google, dùng chung với các client khác cùng model</span>
+    <b>Pool key Google hôm nay</b> <span class="hint">— dùng chung với các client khác cùng model; key này không gọi được quá phần còn lại ở đây dù hạn mức riêng còn</span>
     <div data-k="quota" style="margin:6px 0 14px">${quotaTable(c)}</div>
     <b>Lệnh curl mẫu</b>
     <div class="snip"></div></td>`;

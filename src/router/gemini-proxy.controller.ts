@@ -118,12 +118,12 @@ export class GeminiProxyController {
       (typeof req.query.key === "string" ? req.query.key : "");
     if (got) {
       if (master && got === master)
-        return { id: null, name: "master", allowedModels: null };
+        return { id: null, name: "master", allowedModels: null, dailyLimit: null };
       const c = this.clients.authenticate(got);
       if (c) return c;
     }
     if (!master && this.clients.count() === 0)
-      return { id: null, name: "open", allowedModels: null };
+      return { id: null, name: "open", allowedModels: null, dailyLimit: null };
     res
       .status(401)
       .json(
@@ -393,8 +393,38 @@ export class GeminiProxyController {
       let tries = 0;
       let skipModel = false;
       while (tries < this.maxAttempts) {
-        const r = this.quota.reserve(limit, t.model, est, exclude, client.id);
+        const r = this.quota.reserve(
+          limit,
+          t.model,
+          est,
+          exclude,
+          client.id,
+          client.dailyLimit,
+        );
         if (!r.ok) {
+          // hạn mức riêng của client key: đổi key Google hay đổi model cũng không gọi tiếp được
+          if (r.reason === "client_limit") {
+            const retryAfter = Math.max(
+              1,
+              Math.ceil(((r.retryAt ?? Date.now()) - Date.now()) / 1000),
+            );
+            res.setHeader("Retry-After", String(retryAfter));
+            res.setHeader("x-gg-attempts", String(attempts.length));
+            return res.status(429).json(
+              errBody(
+                t.fmt,
+                429,
+                "RESOURCE_EXHAUSTED",
+                `Key "${client.name}" đã hết hạn mức ${client.dailyLimit} request/ngày — reset lúc 00:00 giờ Pacific (sau ~${retryAfter}s)`,
+                {
+                  router: {
+                    retryAfterSeconds: retryAfter,
+                    clientLimit: client.dailyLimit,
+                  },
+                },
+              ),
+            );
+          }
           if (tries === 0)
             exhausted.push({
               limit,
