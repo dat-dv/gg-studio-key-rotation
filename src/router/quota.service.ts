@@ -40,7 +40,15 @@ interface LogRow {
 }
 
 export type ReserveResult =
-  | { ok: true; key: ApiKeyRow; logId: number; /** request này là lượt thử dò cho cặp key+model vừa bị 429 */ probe: boolean }
+  | {
+      ok: true;
+      key: ApiKeyRow;
+      logId: number;
+      /** request này là lượt thử dò cho cặp key+model vừa bị 429 */
+      probe: boolean;
+      /** số request hôm nay của client key, đã tính cả request này; null khi key không có hạn mức riêng */
+      clientUsed: number | null;
+    }
   | { ok: false; reason: 'no_keys' | 'exhausted' | 'client_limit'; retryAt: number | null; detail: string[] };
 
 /*
@@ -162,17 +170,18 @@ redis.call('PEXPIRE', P .. 'win:' .. pair, 120000)
 redis.call('PEXPIRE', P .. 'tok:' .. pair, 120000)
 redis.call('SADD', P .. 'pairs:' .. dayStart, pair)
 redis.call('EXPIREAT', P .. 'pairs:' .. dayStart, dayTtl)
+local clientUsed = -1
 if clientId ~= '' then
   local ck = P .. 'client:' .. dayStart .. ':' .. clientId
-  redis.call('INCR', ck)
+  clientUsed = redis.call('INCR', ck)
   redis.call('EXPIREAT', ck, dayTtl)
 end
 redis.call('SET', P .. 'rr:' .. model, bestIdx + 1, 'EX', 172800)
 if bestProbing then
   redis.call('SET', P .. 'probe:' .. pair, logId, 'PX', 60000)
-  return {1, bestIdx, 1}
+  return {1, bestIdx, 1, clientUsed}
 end
-return {1, bestIdx, 0}
+return {1, bestIdx, 0, clientUsed}
 `;
 
 /**
@@ -265,8 +274,61 @@ end
 return out
 `;
 
+/**
+ * Chỉ ĐỌC (không dọn cửa sổ, không cộng gì): số liệu để client tự xem quota còn lại.
+ * ARGV: prefix, now, dayStart, clientId ('' = bỏ qua), m, modelId * m, keyId * n
+ * -> {clientUsed ('' nếu không hỏi), {keyIdx, modelIdx, rpd, rpm, "<until>|<reason>" | ''}*} (idx bắt đầu từ 0)
+ */
+const LUA_REMAINING = `
+local P, now, day, clientId = ARGV[1], tonumber(ARGV[2]), ARGV[3], ARGV[4]
+local m = tonumber(ARGV[5])
+local BASE = 5
+local from = '(' .. string.format('%d', now - 60000)
+local function active(v)
+  if not v then return nil end
+  local sep = string.find(v, '|', 1, true)
+  if tonumber(string.sub(v, 1, sep - 1)) > now then return v end
+  return nil
+end
+local function untilOf(v) return tonumber(string.sub(v, 1, string.find(v, '|', 1, true) - 1)) end
+local out = {}
+for ki = BASE + m + 1, #ARGV do
+  local keyId = ARGV[ki]
+  local cdKey = P .. 'cd:' .. keyId
+  local all = active(redis.call('HGET', cdKey, '*'))
+  for mi = 1, m do
+    local model = ARGV[BASE + mi]
+    local pair = keyId .. '|' .. model
+    local cd = active(redis.call('HGET', cdKey, model))
+    if all and (not cd or untilOf(all) > untilOf(cd)) then cd = all end
+    out[#out + 1] = {
+      ki - BASE - m - 1,
+      mi - 1,
+      redis.call('GET', P .. 'rpd:' .. day .. ':' .. pair) or '0',
+      redis.call('ZCOUNT', P .. 'win:' .. pair, from, '+inf'),
+      cd or '',
+    }
+  end
+end
+local used = ''
+if clientId ~= '' then used = redis.call('GET', P .. 'client:' .. day .. ':' .. clientId) or '0' end
+return {used, out}
+`;
+
+/** Quota còn lại của 1 model trên toàn pool. null = không giới hạn (bảng limits để trống). */
+export interface ModelRemaining {
+  limit: ModelLimit;
+  usedToday: number;
+  remainingToday: number | null;
+  remainingThisMinute: number | null;
+  keys: { enabled: number; available: number; coolingDown: number; nextAvailableAt: number | null };
+  /** model không gọi được: limit 0, nhóm Live API / Agents */
+  unavailableReason: string | null;
+}
+
 type Scripts = {
-  ggReserve(...args: (string | number)[]): Promise<[1, number, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
+  ggRemaining(...args: (string | number)[]): Promise<[string, [number, number, string, number, string][]]>;
+  ggReserve(...args: (string | number)[]): Promise<[1, number, number, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
   ggFinalize(...args: (string | number)[]): Promise<number>;
   ggCooldown(...args: (string | number)[]): Promise<number>;
   ggBackoff(...args: (string | number)[]): Promise<[string, number]>;
@@ -304,6 +366,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     c.defineCommand('ggCooldown', { numberOfKeys: 0, lua: LUA_COOLDOWN });
     c.defineCommand('ggBackoff', { numberOfKeys: 0, lua: LUA_BACKOFF });
     c.defineCommand('ggSnapshot', { numberOfKeys: 0, lua: LUA_SNAPSHOT });
+    c.defineCommand('ggRemaining', { numberOfKeys: 0, lua: LUA_REMAINING });
   }
 
   private get db() {
@@ -613,7 +676,71 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     this.inflight.set(logId, { pair: `${key.id}|${limit.modelId}`, day: start, row });
     this.insertQueue.push(row);
     if (this.insertQueue.length === FLUSH_MAX_QUEUE) setImmediate(() => this.flush());
-    return { ok: true, key, logId, probe: res[2] === 1 };
+    return { ok: true, key, logId, probe: res[2] === 1, clientUsed: res[3] >= 0 ? res[3] : null };
+  }
+
+  /**
+   * Quota còn lại của các model trên toàn pool, cho client tự xem (GET /v1/quota). Chỉ đọc, không tốn quota.
+   * Là ước lượng local: request gọi thẳng Google bằng cùng key thì gateway không đếm được.
+   *  - key đang cooldown tới hết ngày (429 theo ngày): còn 0
+   *  - key đang cooldown ngắn: vẫn tính phần RPD còn lại, nhưng không tính vào số gọi được trong phút này
+   * clientId: client key có hạn mức riêng thì đọc luôn bộ đếm của nó (Redis), null = bỏ qua.
+   */
+  async remaining(models: ModelLimit[], clientId: number | null, now = Date.now()) {
+    const { start, end } = this.day(now);
+    const keys = this.keys.enabledKeys();
+    const out: ModelRemaining[] = models.map((limit) => ({
+      limit,
+      usedToday: 0,
+      remainingToday: 0,
+      remainingThisMinute: 0,
+      keys: { enabled: keys.length, available: 0, coolingDown: 0, nextAvailableAt: null },
+      unavailableReason:
+        limit.unavailableReason ?? (limit.rpm === 0 || limit.tpm === 0 || limit.rpd === 0 ? 'limit = 0' : null),
+    }));
+    const [used, rows] = await this.scripts.ggRemaining(
+      this.P,
+      now,
+      start,
+      clientId ?? '',
+      models.length,
+      ...models.map((m) => m.modelId),
+      ...keys.map((k) => k.id),
+    );
+    // null (không giới hạn) lấn át mọi số khi cộng
+    const add = (a: number | null, b: number | null) => (a === null || b === null ? null : a + b);
+    for (const [, mi, rpd, rpm, cd] of rows) {
+      const m = out[mi];
+      const l = m.limit;
+      const usedDay = Number(rpd);
+      m.usedToday += usedDay;
+      if (m.unavailableReason) continue;
+      const dayLeft = l.rpd === null ? null : Math.max(0, l.rpd - usedDay);
+      const until = cd ? Number(cd.slice(0, cd.indexOf('|'))) : 0;
+      if (until > now) {
+        m.keys.coolingDown++;
+        if (until < end) {
+          m.remainingToday = add(m.remainingToday, dayLeft);
+          m.keys.nextAvailableAt = Math.min(m.keys.nextAvailableAt ?? until, until);
+        }
+        continue;
+      }
+      m.remainingToday = add(m.remainingToday, dayLeft);
+      const minuteLeft = l.rpm === null ? dayLeft : Math.max(0, l.rpm - Number(rpm));
+      const nowLeft = minuteLeft === null || dayLeft === null ? (minuteLeft ?? dayLeft) : Math.min(minuteLeft, dayLeft);
+      m.remainingThisMinute = add(m.remainingThisMinute, nowLeft);
+      if (nowLeft === null || nowLeft > 0) m.keys.available++;
+    }
+    return { now, dayStart: start, resetAt: end, clientUsed: used === '' ? null : Number(used), models: out };
+  }
+
+  /** Số request tính quota hôm nay của 1 client key (đọc log; dùng cho key không có hạn mức riêng nên không có bộ đếm Redis). */
+  clientRequestsToday(clientId: number, now = Date.now()) {
+    this.flush();
+    const r = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM request_log WHERE ts >= ? AND client_id = ? AND status IN ${COUNTED}`)
+      .get(this.day(now).start, clientId) as { n: number };
+    return r.n;
   }
 
   /** Chốt kết quả 1 request: sửa dòng log, và trả lại chỗ trong Redis nếu request không tính quota. Không ném lỗi. */

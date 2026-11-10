@@ -158,10 +158,28 @@ curl "http://<server>:4041/v1beta/models/gemini-2.5-flash:generateContent" \
 | `POST /v1/chat/completions` | OpenAI, có stream |
 | `POST /v1/embeddings` | OpenAI |
 | `GET /v1/models` | Key bị giới hạn chỉ thấy model của nó |
+| `GET /v1/quota` | Quota còn lại của key đang gọi, không tốn quota (xem mục dưới) |
 | `POST /v1beta/models/{model}:generateContent` | Gemini gốc, kể cả `streamGenerateContent`, `embedContent` |
 | `GET /healthz` | Healthcheck |
 
 Mã lỗi từ gateway: `401` key sai/bị tắt, `403` model không được phép, `400` model chưa có trong bảng limits, `429` hết quota (xem `Retry-After`).
+
+**Xem quota còn lại từ phía client.** Bên gọi tự hỏi được còn bao nhiêu request, bằng chính client key, không cần quyền admin và không tốn quota:
+
+```bash
+curl "http://<server>:4041/v1/quota?model=gemini-3.8-flash" -H "Authorization: Bearer sk-gg-..."
+```
+
+Bỏ `?model=` thì trả mọi model key được phép dùng. Response gồm:
+
+- `client`: hạn mức riêng của key (`dailyLimit`, `null` = không giới hạn), `usedToday`, `remainingToday`.
+- `models[]`: với từng model, `remainingToday` = tổng phần RPD còn lại trên mọi key Google đang bật (key bị 429 theo ngày tính 0), `remainingThisMinute` = số request gửi được ngay (theo RPM, bỏ key đang cooldown), `keys` = số key đang bật / dùng được / đang cooldown và lúc key cooldown sớm nhất mở lại. `null` = bảng limits để trống, không giới hạn.
+- `autoRemainingToday`: còn bao nhiêu request khi gọi chat bằng tên tự chọn (vd `auto`), lấy số nhỏ hơn giữa hạn mức client và tổng các model chat được phép.
+- `resetAt` / `resetInSeconds`: 00:00 giờ Pacific.
+
+Key có hạn mức riêng còn nhận thêm header trên mọi response thành công (và trên `/v1/quota`): `x-gg-client-limit-requests`, `x-gg-client-remaining-requests`, `x-gg-client-reset-requests`, và bản trùng tên của OpenAI `x-ratelimit-limit-requests` / `x-ratelimit-remaining-requests` / `x-ratelimit-reset-requests`. Các header này là số của **client key**, không phải của model; muốn biết model còn bao nhiêu thì gọi `/v1/quota`.
+
+Mọi số ở đây là **ước lượng**: gateway chỉ đếm request đi qua nó, request gọi thẳng Google bằng cùng key Google thì không thấy (Google trả 429 thì gateway tự khoá key đó, nên request vẫn không hỏng).
 
 ### 5. Chuyển dữ liệu giữa các máy
 
