@@ -96,13 +96,36 @@ export class LimitsService implements OnModuleInit {
    * Chỉ nạp những model gateway dùng được (limit khác 0, không thuộc nhóm Agents / Live API).
    * Dòng không dùng được mà đang có trong bảng thì bị gỡ ra. Lịch sử usage (request_log) không bị đụng tới.
    */
-  import(raw: string, mode: 'merge' | 'replace' = 'merge') {
+  private classify(raw: string) {
     const parsed = parseLimitsTable(raw || '');
     if (!parsed.length) throw new BadRequestException('Không parse được dòng model nào từ nội dung đã paste');
     const usable = parsed.filter((p) => !unusableReason(p)).map((p, i) => ({ ...p, sortOrder: i }));
     const skipped = parsed
       .filter((p) => unusableReason(p))
-      .map((p) => ({ modelId: p.modelId, displayName: p.displayName, reason: unusableReason(p)! }));
+      .map((p) => ({ modelId: p.modelId, displayName: p.displayName, category: p.category, reason: unusableReason(p)! }));
+    return { usable, skipped };
+  }
+
+  /** Xem trước kết quả import mà không ghi gì: model nào được nạp, model nào bị lược bớt và vì sao. */
+  preview(raw: string, mode: 'merge' | 'replace' = 'merge') {
+    const { usable, skipped } = this.classify(raw);
+    const current = this.list();
+    const incoming = new Set(usable.map((u) => u.modelId));
+    const skippedIds = new Set(skipped.map((s) => s.modelId));
+    // model đang có trong bảng sẽ biến mất sau import
+    const removed = current
+      .filter((c) => (mode === 'replace' ? !incoming.has(c.modelId) : skippedIds.has(c.modelId)))
+      .map((c) => ({ modelId: c.modelId, displayName: c.displayName }));
+    return {
+      mode,
+      usable: usable.map((u) => ({ modelId: u.modelId, displayName: u.displayName, rpm: u.rpm, tpm: u.tpm, rpd: u.rpd })),
+      skipped,
+      removed,
+    };
+  }
+
+  import(raw: string, mode: 'merge' | 'replace' = 'merge') {
+    const { usable, skipped } = this.classify(raw);
     const stmt = this.upsertStmt();
     const del = this.db.prepare('DELETE FROM model_limits WHERE model_id = ?');
     let removed = 0;

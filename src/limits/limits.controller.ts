@@ -12,6 +12,12 @@ export class LimitsController {
     return this.limits.list();
   }
 
+  /** Xem trước: model nào sẽ được nạp, model nào bị lược bớt vì gateway không hỗ trợ. Không ghi gì. */
+  @Post('preview')
+  preview(@Body() body: { raw?: string; mode?: 'merge' | 'replace' }) {
+    return this.limits.preview(body?.raw || '', body?.mode === 'replace' ? 'replace' : 'merge');
+  }
+
   /** Paste nguyên bảng Rate limits từ AI Studio. mode=replace xoá hết rồi nạp lại. */
   @Post('import')
   import(@Body() body: { raw?: string; mode?: 'merge' | 'replace' }) {

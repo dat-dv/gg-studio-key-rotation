@@ -168,6 +168,7 @@
         <button class="btn danger" id="importReplace">Import (thay toàn bộ)</button>
         <span class="hint">Chỉ nạp model dùng được qua gateway: bỏ qua model limit 0, nhóm Agents, Live API và phần Tools. Usage đã ghi không bị xoá.</span>
       </div>
+      <div id="importPreview" class="tokenbox" style="border-color:var(--border)" hidden></div>
     </div>
     <div class="card">
       <h2>Bảng limit free tier (áp cho mỗi project)</h2>
@@ -415,9 +416,35 @@ $('#addLimit').onclick = async () => {
   const modelId = prompt('Model id (vd gemini-2.5-flash)'); if (!modelId) return;
   try { await api('/api/limits', { method: 'POST', body: JSON.stringify({ modelId, displayName: modelId }) }); await refresh(); renderLimits(); } catch (e) { toast(e.message); }
 };
+// Bước 1: xem trước -> hiện rõ model nào bị lược bớt và vì sao. Bước 2: người dùng xác nhận mới ghi.
 async function importLimits(mode) {
-  if (mode === 'replace' && !confirm('Thay toàn bộ bảng limit? Alias đã sửa tay sẽ mất.')) return;
-  try { const r = await api('/api/limits/import', { method: 'POST', body: JSON.stringify({ raw: $('#limitsRaw').value, mode }) }); toast(`Đã import ${r.imported} model dùng được, bỏ qua ${r.skipped.length} model không dùng được` + (r.removed ? `, gỡ ${r.removed} model cũ khỏi bảng` : '')); $('#limitsRaw').value = ''; await refresh(); renderLimits(); } catch (e) { toast(e.message); }
+  const raw = $('#limitsRaw').value;
+  const box = $('#importPreview');
+  let p;
+  try { p = await api('/api/limits/preview', { method: 'POST', body: JSON.stringify({ raw, mode }) }); } catch (e) { box.hidden = true; return toast(e.message); }
+  const groups = {};
+  for (const s of p.skipped) (groups[s.reason] ||= []).push(s.displayName);
+  box.hidden = false;
+  box.innerHTML = `
+    <b>${mode === 'replace' ? 'Thay toàn bộ bảng limit' : 'Import (merge)'} — xem trước</b>
+    <p class="ok" style="margin:8px 0 4px"><b>Sẽ nạp ${p.usable.length} model dùng được:</b></p>
+    <div class="hint">${p.usable.map((u) => esc(u.displayName)).join(' · ') || '(không có)'}</div>
+    ${p.skipped.length ? `<p class="warn" style="margin:12px 0 4px"><b>Sẽ lược bớt ${p.skipped.length} model vì hệ thống không dùng được:</b></p>
+      ${Object.entries(groups).map(([reason, names]) => `<div style="margin-bottom:6px"><span class="badge warn">${esc(reason)} · ${names.length}</span><div class="hint">${names.map(esc).join(' · ')}</div></div>`).join('')}` : ''}
+    ${p.removed.length ? `<p class="bad" style="margin:12px 0 4px"><b>${p.removed.length} model đang có trong bảng sẽ bị gỡ:</b></p><div class="hint">${p.removed.map((r) => esc(r.displayName)).join(' · ')}</div>` : ''}
+    <p class="hint" style="margin:12px 0 8px">Lịch sử usage không bị xoá.${mode === 'replace' ? ' Alias đã sửa tay sẽ mất.' : ''}</p>
+    <div class="row"><button class="btn primary" id="importConfirm">Xác nhận import ${p.usable.length} model</button><button class="btn" id="importCancel">Huỷ</button></div>`;
+  $('#importCancel').onclick = () => { box.hidden = true; };
+  $('#importConfirm').onclick = async () => {
+    try {
+      const r = await api('/api/limits/import', { method: 'POST', body: JSON.stringify({ raw, mode }) });
+      box.hidden = true;
+      $('#limitsRaw').value = '';
+      toast(`Đã import ${r.imported} model, lược bớt ${r.skipped.length} model không dùng được`);
+      await refresh(); renderLimits();
+    } catch (e) { toast(e.message); }
+  };
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 $('#importMerge').onclick = () => importLimits('merge');
 $('#importReplace').onclick = () => importLimits('replace');
