@@ -18,6 +18,8 @@ const COUNTED_METHODS = new Set([
 ]);
 /** Model gateway tự chọn mà Google trả 404: bỏ qua trong bao lâu trước khi thử lại. */
 const MODEL_NOT_FOUND_COOLDOWN_MS = 3600_000;
+/** Google trả 429 liên tiếp cho một cặp key+model: thời gian khoá tăng gấp đôi mỗi lần, tối đa chừng này. */
+const RATE_LIMIT_BACKOFF_CAP_MS = 3600_000;
 const PATH_RE = /^\/(v1beta|v1|v1alpha)\/models\/([^/:]+):([A-Za-z]+)$/;
 
 function estimateTokens(body: unknown): number {
@@ -531,11 +533,21 @@ export class GeminiProxyController {
           case "rate_limit": {
             // Local nói còn quota nhưng Google nói hết -> tin Google: cooldown theo loại quota bị vượt.
             const perDay = ce.quotaIds.some((q) => /PerDay/i.test(q));
-            const until = perDay
-              ? quotaDayEnd()
-              : Date.now() + Math.max(ce.retryDelayMs ?? 60_000, 5_000);
-            const why = `429 ${ce.quotaIds[0] || "RESOURCE_EXHAUSTED"}`;
-            await this.quota.setCooldown(key.id, limit.modelId, until, why);
+            let why = `429 ${ce.quotaIds[0] || "RESOURCE_EXHAUSTED"}`;
+            let until: number;
+            if (perDay) {
+              until = quotaDayEnd();
+              await this.quota.setCooldown(key.id, limit.modelId, until, why);
+            } else {
+              // Không biết là quota phút hay ngày (Google thường không nói): khoá lâu dần. Quota phút thì phút sau
+              // gọi lại được và chuỗi tự xoá; quota ngày đã cạn thì mỗi lần thử lại thất bại khoá gấp đôi, tối đa
+              // 1 giờ và không quá giờ reset, thay vì cứ 60s lại bắn một loạt request vô ích lên Google.
+              const base = Math.max(ce.retryDelayMs ?? 60_000, 5_000);
+              const cap = Math.max(base, Math.min(RATE_LIMIT_BACKOFF_CAP_MS, quotaDayEnd() - Date.now()));
+              const b = await this.quota.backoff(key.id, limit.modelId, base, cap, why);
+              until = b.until;
+              if (b.strikes > 1) why += ` (lần ${b.strikes} liên tiếp)`;
+            }
             await this.quota.finalize(logId, {
               status: "rate_limited",
               httpStatus: 429,

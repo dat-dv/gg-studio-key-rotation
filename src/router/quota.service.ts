@@ -51,6 +51,7 @@ export type ReserveResult =
  *   client:<dayStart>:<clientId> số request tính quota hôm nay của client key
  *   pairs:<dayStart>             SET các pair có số liệu hôm nay (cho dashboard)
  *   cd:<keyId>                   HASH modelId|"*" -> "<until>|<reason>"
+ *   strike:<pair>                số lần liên tiếp Google trả 429 cho pair (về 0 khi có request thành công)
  *   rr:<modelId>                 con trỏ xoay vòng
  *   seeded                       đã nạp bộ đếm từ request_log (Redis mới / mất dữ liệu thì nạp lại)
  */
@@ -165,11 +166,13 @@ return {1, bestIdx}
 
 /**
  * Chốt 1 request. counted=1 (ok/error): giữ chỗ, cập nhật token thật. Ngược lại (Google từ chối, lỗi mạng...):
- * trả lại chỗ. ARGV: prefix, pair, dayStart (của lúc giữ chỗ), logId, counted, tokens, clientId
+ * trả lại chỗ. ARGV: prefix, pair, dayStart (của lúc giữ chỗ), logId, counted, tokens, clientId, ok
+ * ok=1 (Google trả 200): xoá chuỗi 429 liên tiếp của pair.
  */
 const LUA_FINALIZE = `
 local P, pair, day, logId, counted, tokens, clientId = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
 local tk = P .. 'tok:' .. pair
+if ARGV[8] == '1' then redis.call('DEL', P .. 'strike:' .. pair) end
 if counted == '1' then
   if tokens ~= '' and redis.call('HEXISTS', tk, logId) == 1 then redis.call('HSET', tk, logId, tokens) end
   return 1
@@ -200,6 +203,37 @@ if redis.call('PTTL', k) < need then redis.call('PEXPIRE', k, need) end
 return 1
 `;
 
+/**
+ * Google trả 429 mà không nói rõ quota nào: khoá pair lâu dần. Lần đầu khoá base, mỗi lần 429 liên tiếp sau đó
+ * gấp đôi, tối đa cap. Pair đang bị khoá thì KHÔNG tính thêm lần (các request đồng thời đã lỡ gửi đi cùng nhận 429
+ * chỉ tính là 1 lần). ARGV: prefix, keyId, modelId, now, baseMs, capMs, reason -> {until, số lần liên tiếp}
+ */
+const LUA_BACKOFF = `
+local P, keyId, model = ARGV[1], ARGV[2], ARGV[3]
+local now, base, cap = tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6])
+local ck = P .. 'cd:' .. keyId
+local sk = P .. 'strike:' .. keyId .. '|' .. model
+local cur = redis.call('HGET', ck, model)
+if cur then
+  local u = tonumber(string.sub(cur, 1, string.find(cur, '|', 1, true) - 1))
+  if u > now then return {string.format('%d', u), tonumber(redis.call('GET', sk) or '1')} end
+end
+local n = redis.call('INCR', sk)
+local dur = base
+for i = 2, n do
+  dur = dur * 2
+  if dur >= cap then dur = math.max(cap, base); break end
+end
+local untilTs = now + dur
+redis.call('PEXPIRE', sk, dur * 2 + 600000)
+local reason = ARGV[7]
+if n > 1 then reason = reason .. ' (lần ' .. n .. ' liên tiếp)' end
+redis.call('HSET', ck, model, string.format('%d', untilTs) .. '|' .. reason)
+local need = dur + 60000
+if redis.call('PTTL', ck) < need then redis.call('PEXPIRE', ck, need) end
+return {string.format('%d', untilTs), n}
+`;
+
 /** Số liệu dashboard của mọi pair có hoạt động hôm nay. ARGV: prefix, now, dayStart -> {pair, rpd, rpm, tpm}* */
 const LUA_SNAPSHOT = `
 local P, now, day = ARGV[1], tonumber(ARGV[2]), ARGV[3]
@@ -223,6 +257,7 @@ type Scripts = {
   ggReserve(...args: (string | number)[]): Promise<[1, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
   ggFinalize(...args: (string | number)[]): Promise<number>;
   ggCooldown(...args: (string | number)[]): Promise<number>;
+  ggBackoff(...args: (string | number)[]): Promise<[string, number]>;
   ggSnapshot(...args: (string | number)[]): Promise<[string, string, number, string][]>;
 };
 
@@ -255,6 +290,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     c.defineCommand('ggReserve', { numberOfKeys: 0, lua: LUA_RESERVE });
     c.defineCommand('ggFinalize', { numberOfKeys: 0, lua: LUA_FINALIZE });
     c.defineCommand('ggCooldown', { numberOfKeys: 0, lua: LUA_COOLDOWN });
+    c.defineCommand('ggBackoff', { numberOfKeys: 0, lua: LUA_BACKOFF });
     c.defineCommand('ggSnapshot', { numberOfKeys: 0, lua: LUA_SNAPSHOT });
   }
 
@@ -404,7 +440,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   async resetCounters(wipeCooldowns = false) {
     this.flush();
     this.inflight.clear();
-    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', ...(wipeCooldowns ? ['cd:*'] : [])];
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', ...(wipeCooldowns ? ['cd:*', 'strike:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
       for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
@@ -425,9 +461,30 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     }
   }
 
+  /**
+   * Google trả 429 không kèm loại quota: khoá cặp key+model lâu dần (base, 2x, 4x... tối đa capMs) cho tới khi
+   * có request thành công. Trả về thời điểm hết khoá và số lần 429 liên tiếp. Không ném lỗi.
+   */
+  async backoff(keyId: number, modelId: string, baseMs: number, capMs: number, reason: string) {
+    const now = Date.now();
+    try {
+      const [until, strikes] = await this.scripts.ggBackoff(this.P, keyId, modelId, now, Math.floor(baseMs), Math.floor(capMs), reason.replace(/\s+/g, ' ').slice(0, 200));
+      return { until: Number(until), strikes };
+    } catch (e: any) {
+      this.log.error(`backoff #${keyId} ${modelId}: ${e?.message || e}`);
+      return { until: now + baseMs, strikes: 1 };
+    }
+  }
+
+  /** Bỏ cooldown (nút trên tab Quota) và xoá luôn chuỗi 429 liên tiếp để lần sau tính lại từ đầu. */
   async clearCooldown(keyId: number, modelId?: string) {
-    if (modelId) await this.r.hdel(`${this.P}cd:${keyId}`, modelId);
-    else await this.r.del(`${this.P}cd:${keyId}`);
+    if (modelId) {
+      await this.r.hdel(`${this.P}cd:${keyId}`, modelId);
+      await this.r.del(`${this.P}strike:${keyId}|${modelId}`);
+    } else {
+      const strikes = await this.redis.scan(`strike:${keyId}|*`);
+      await this.r.del(`${this.P}cd:${keyId}`, ...strikes);
+    }
   }
 
   /** Bỏ cooldown của 1 model trên mọi key (model bị đổi id / sửa ở tab Limits). */
@@ -436,6 +493,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     if (!keys.length) return;
     const pipe = this.r.pipeline();
     for (const k of keys) pipe.hdel(k, modelId);
+    for (const k of await this.redis.scan(`strike:*|${modelId}`)) pipe.del(k);
     await pipe.exec();
   }
 
@@ -552,9 +610,10 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     if (!row.queued) this.updateQueue.push(row);
 
     const counted = p.status === 'ok' || p.status === 'error';
-    if (counted && p.tokens == null) return; // giữ nguyên chỗ và số token ước lượng
+    const ok = p.status === 'ok';
+    if (counted && !ok && p.tokens == null) return; // giữ nguyên chỗ và số token ước lượng
     try {
-      await this.scripts.ggFinalize(this.P, f.pair, f.day, logId, counted ? 1 : 0, p.tokens ?? '', row.clientId ?? '');
+      await this.scripts.ggFinalize(this.P, f.pair, f.day, logId, counted ? 1 : 0, p.tokens ?? '', row.clientId ?? '', ok ? 1 : 0);
     } catch (e: any) {
       this.log.error(`finalize #${logId}: ${e?.message || e}`);
     }
