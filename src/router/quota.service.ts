@@ -40,7 +40,7 @@ interface LogRow {
 }
 
 export type ReserveResult =
-  | { ok: true; key: ApiKeyRow; logId: number }
+  | { ok: true; key: ApiKeyRow; logId: number; /** request này là lượt thử dò cho cặp key+model vừa bị 429 */ probe: boolean }
   | { ok: false; reason: 'no_keys' | 'exhausted' | 'client_limit'; retryAt: number | null; detail: string[] };
 
 /*
@@ -52,13 +52,15 @@ export type ReserveResult =
  *   pairs:<dayStart>             SET các pair có số liệu hôm nay (cho dashboard)
  *   cd:<keyId>                   HASH modelId|"*" -> "<until>|<reason>"
  *   strike:<pair>                số lần liên tiếp Google trả 429 cho pair (về 0 khi có request thành công)
+ *   probe:<pair>                 logId của request đang đi thử dò cho pair vừa bị 429 (TTL 60s)
  *   rr:<modelId>                 con trỏ xoay vòng
  *   seeded                       đã nạp bộ đếm từ request_log (Redis mới / mất dữ liệu thì nạp lại)
  */
 
 /**
  * Giữ chỗ nguyên tử: kiểm tra hạn mức client, duyệt key theo vòng xoay, bỏ key đang cooldown / hết RPD / RPM / TPM,
- * chọn key ĐÃ DÙNG ÍT NHẤT rồi cộng bộ đếm ngay. Cả đoạn chạy trong 1 script nên request (kể cả từ instance khác)
+ * chọn key ĐÃ DÙNG ÍT NHẤT rồi cộng bộ đếm ngay. Pair vừa bị 429 (còn strike) mà đã hết cooldown thì chỉ cho MỘT
+ * request đi thử dò; các request khác bỏ qua pair đó cho tới khi request dò có kết quả. Cả đoạn chạy trong 1 script nên request (kể cả từ instance khác)
  * tới sau luôn thấy số của request tới trước.
  * ARGV: prefix, now, dayStart, dayEnd, model, estTokens, logId, rpm, tpm, rpd, clientId, clientLimit, rồi (keyId, excluded)*
  */
@@ -87,7 +89,7 @@ local start = tonumber(redis.call('GET', P .. 'rr:' .. model) or '0') % n
 local retryAt = -1
 local function retry(t) if retryAt < 0 or t < retryAt then retryAt = t end end
 local detail = {}
-local bestIdx, bestRpd, bestRpm = -1, 0, 0
+local bestIdx, bestRpd, bestRpm, bestProbing = -1, 0, 0, false
 
 for i = 0, n - 1 do
   local idx = (start + i) % n
@@ -108,9 +110,14 @@ for i = 0, n - 1 do
         end
       end
     end
+    local probing = false
+    if cdUntil == 0 then probing = redis.call('EXISTS', P .. 'strike:' .. pair) == 1 end
     if cdUntil > 0 then
       retry(cdUntil)
       detail[#detail + 1] = {idx, 'cooldown', cdReason}
+    elseif probing and redis.call('EXISTS', P .. 'probe:' .. pair) == 1 then
+      retry(now + 2000)
+      detail[#detail + 1] = {idx, 'probe', ''}
     else
       local wk, tk = P .. 'win:' .. pair, P .. 'tok:' .. pair
       local old = redis.call('ZRANGEBYSCORE', wk, '-inf', cut)
@@ -136,7 +143,7 @@ for i = 0, n - 1 do
         retry(oldest + 60000)
         detail[#detail + 1] = {idx, 'tpm', tostring(uTpm)}
       elseif bestIdx < 0 or uRpd < bestRpd or (uRpd == bestRpd and uRpm < bestRpm) then
-        bestIdx, bestRpd, bestRpm = idx, uRpd, uRpm
+        bestIdx, bestRpd, bestRpm, bestProbing = idx, uRpd, uRpm, probing
       end
     end
   end
@@ -161,7 +168,11 @@ if clientId ~= '' then
   redis.call('EXPIREAT', ck, dayTtl)
 end
 redis.call('SET', P .. 'rr:' .. model, bestIdx + 1, 'EX', 172800)
-return {1, bestIdx}
+if bestProbing then
+  redis.call('SET', P .. 'probe:' .. pair, logId, 'PX', 60000)
+  return {1, bestIdx, 1}
+end
+return {1, bestIdx, 0}
 `;
 
 /**
@@ -172,6 +183,7 @@ return {1, bestIdx}
 const LUA_FINALIZE = `
 local P, pair, day, logId, counted, tokens, clientId = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
 local tk = P .. 'tok:' .. pair
+if redis.call('GET', P .. 'probe:' .. pair) == logId then redis.call('DEL', P .. 'probe:' .. pair) end
 if ARGV[8] == '1' then redis.call('DEL', P .. 'strike:' .. pair) end
 if counted == '1' then
   if tokens ~= '' and redis.call('HEXISTS', tk, logId) == 1 then redis.call('HSET', tk, logId, tokens) end
@@ -254,7 +266,7 @@ return out
 `;
 
 type Scripts = {
-  ggReserve(...args: (string | number)[]): Promise<[1, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
+  ggReserve(...args: (string | number)[]): Promise<[1, number, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
   ggFinalize(...args: (string | number)[]): Promise<number>;
   ggCooldown(...args: (string | number)[]): Promise<number>;
   ggBackoff(...args: (string | number)[]): Promise<[string, number]>;
@@ -440,7 +452,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   async resetCounters(wipeCooldowns = false) {
     this.flush();
     this.inflight.clear();
-    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', ...(wipeCooldowns ? ['cd:*', 'strike:*'] : [])];
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
       for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
@@ -476,14 +488,26 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     }
   }
 
+  /**
+   * Lượt thử dò vừa được Google nhận (200): mở lại cặp key+model ngay, không chờ response chạy xong
+   * (response stream có thể kéo dài cả phút). Không ném lỗi.
+   */
+  async probeSucceeded(keyId: number, modelId: string) {
+    try {
+      await this.r.del(`${this.P}strike:${keyId}|${modelId}`, `${this.P}probe:${keyId}|${modelId}`);
+    } catch (e: any) {
+      this.log.error(`probeSucceeded #${keyId} ${modelId}: ${e?.message || e}`);
+    }
+  }
+
   /** Bỏ cooldown (nút trên tab Quota) và xoá luôn chuỗi 429 liên tiếp để lần sau tính lại từ đầu. */
   async clearCooldown(keyId: number, modelId?: string) {
     if (modelId) {
       await this.r.hdel(`${this.P}cd:${keyId}`, modelId);
-      await this.r.del(`${this.P}strike:${keyId}|${modelId}`);
+      await this.r.del(`${this.P}strike:${keyId}|${modelId}`, `${this.P}probe:${keyId}|${modelId}`);
     } else {
-      const strikes = await this.redis.scan(`strike:${keyId}|*`);
-      await this.r.del(`${this.P}cd:${keyId}`, ...strikes);
+      const extra = [...(await this.redis.scan(`strike:${keyId}|*`)), ...(await this.redis.scan(`probe:${keyId}|*`))];
+      await this.r.del(`${this.P}cd:${keyId}`, ...extra);
     }
   }
 
@@ -563,6 +587,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
         const k = keys[idx];
         const label = `${k.account}/${k.project}`;
         if (kind === 'cooldown') return `${label}: cooldown (${v})`;
+        if (kind === 'probe') return `${label}: đang thử dò lại sau 429`;
         if (kind === 'rpd') return `${label}: hết RPD ${v}/${limit.rpd}`;
         if (kind === 'rpm') return `${label}: hết RPM ${v}/${limit.rpm}`;
         return `${label}: hết TPM ${v}+~${estTokens}/${limit.tpm}`;
@@ -588,7 +613,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     this.inflight.set(logId, { pair: `${key.id}|${limit.modelId}`, day: start, row });
     this.insertQueue.push(row);
     if (this.insertQueue.length === FLUSH_MAX_QUEUE) setImmediate(() => this.flush());
-    return { ok: true, key, logId };
+    return { ok: true, key, logId, probe: res[2] === 1 };
   }
 
   /** Chốt kết quả 1 request: sửa dòng log, và trả lại chỗ trong Redis nếu request không tính quota. Không ném lỗi. */

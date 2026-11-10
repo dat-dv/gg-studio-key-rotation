@@ -32,10 +32,10 @@ const json = (path: string, method: string, body?: unknown) =>
     headers: { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-const call = () => json(`/v1beta/models/${MODEL}:generateContent`, 'POST', { contents: [{ parts: [{ text: 'hi' }] }] });
-const cooldown = async () => {
+const call = (model = MODEL) => json(`/v1beta/models/${model}:generateContent`, 'POST', { contents: [{ parts: [{ text: 'hi' }] }] });
+const cooldown = async (model = MODEL) => {
   const u = (await (await json('/api/usage', 'GET')).json()) as { now: number; cooldowns: { modelId: string; until: number; reason: string }[] };
-  const c = u.cooldowns.find((x) => x.modelId === MODEL);
+  const c = u.cooldowns.find((x) => x.modelId === model);
   return c ? { ms: c.until - u.now, reason: c.reason } : null;
 };
 
@@ -43,13 +43,17 @@ before(async () => {
   upstream = createServer((req, res) => {
     upstreamHits++;
     req.resume();
-    res.writeHead(upstreamStatus, { 'content-type': 'application/json' });
-    res.end(
-      upstreamStatus === 200
-        ? JSON.stringify({ candidates: [], usageMetadata: { totalTokenCount: 7 } })
-        : // giống lỗi thật của Google khi cạn quota: không kèm QuotaFailure / RetryInfo
-          JSON.stringify({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted (e.g. check quota).' } }),
-    );
+    const status = upstreamStatus;
+    // trả lời chậm một chút để các request đồng thời thật sự chồng lên nhau
+    setTimeout(() => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(
+        status === 200
+          ? JSON.stringify({ candidates: [], usageMetadata: { totalTokenCount: 7 } })
+          : // giống lỗi thật của Google khi cạn quota: không kèm QuotaFailure / RetryInfo
+            JSON.stringify({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted (e.g. check quota).' } }),
+      );
+    }, 30);
   });
   await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
   process.env.GEMINI_BASE_URL = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
@@ -129,4 +133,38 @@ test('có request thành công thì chuỗi 429 được xoá, lần sau tính l
   const c = await cooldown();
   assert.ok(c && c.ms <= 60_000, 'sau khi có request 200, 429 kế tiếp lại chỉ khoá 60s');
   assert.doesNotMatch(c.reason, /liên tiếp/);
+});
+
+/** Đưa cặp key+model về trạng thái "vừa bị 429, đã hết khoá": còn chuỗi 429 nhưng không còn cooldown. */
+const justRecovered = async (model: string) => {
+  const b = await quota.backoff(keyId, model, 20, 20, '429 RESOURCE_EXHAUSTED');
+  await sleep(b.until - Date.now() + 5);
+};
+
+test('cặp vừa bị 429, hết khoá: 6 request cùng lúc chỉ 1 request được đi thử; thử thất bại thì khoá tiếp', async () => {
+  const M = 'gemini-2.5-flash-lite'; // RPM 10: không có cơ chế dò thì cả 6 request đều tới Google
+  await justRecovered(M);
+  upstreamStatus = 429;
+  const hits = upstreamHits;
+  const statuses = (await Promise.all(Array.from({ length: 6 }, () => call(M)))).map((r) => r.status);
+  assert.deepEqual(statuses, Array(6).fill(429));
+  assert.equal(upstreamHits, hits + 1, 'chỉ 1 request dò tới Google');
+  const c = await cooldown(M);
+  assert.match(c?.reason ?? '', /lần 2 liên tiếp/);
+});
+
+test('request dò thành công thì cặp key+model mở lại bình thường', async () => {
+  const M = 'gemini-2.5-flash'; // RPM 5
+  await justRecovered(M);
+  upstreamStatus = 200;
+  let hits = upstreamHits;
+  const first = (await Promise.all(Array.from({ length: 4 }, () => call(M)))).map((r) => r.status).sort();
+  assert.deepEqual(first, [200, 429, 429, 429], '1 request dò đi qua, 3 request còn lại không tới Google');
+  assert.equal(upstreamHits, hits + 1);
+
+  hits = upstreamHits;
+  const next = (await Promise.all(Array.from({ length: 4 }, () => call(M)))).map((r) => r.status);
+  assert.deepEqual(next, [200, 200, 200, 200], 'đã mở lại: 4 request cùng lúc đều đi');
+  assert.equal(upstreamHits, hits + 4);
+  assert.equal(await cooldown(M), null);
 });

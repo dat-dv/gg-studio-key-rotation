@@ -58,7 +58,7 @@ flowchart LR
 |---|---|
 | 200 | Cập nhật số token thật, trả kết quả |
 | 429 quota theo ngày | Khoá cặp key + model tới 00:00 giờ Pacific, thử key khác |
-| 429 khác (quota theo phút, hoặc Google không nói rõ) | Khoá theo `retryDelay` (mặc định 60s), thử key khác. Cặp key + model bị 429 liên tiếp thì mỗi lần khoá gấp đôi, tối đa 1 giờ; có request thành công thì tính lại từ đầu |
+| 429 khác (quota theo phút, hoặc Google không nói rõ) | Khoá theo `retryDelay` (mặc định 60s), thử key khác. Cặp key + model bị 429 liên tiếp thì mỗi lần khoá gấp đôi, tối đa 1 giờ. Hết khoá thì chỉ **một** request được đi thử dò, các request khác bỏ qua cặp đó; thử thành công mới mở lại bình thường |
 | Key không hợp lệ / project bị khoá | Tắt hẳn key, thử key khác |
 | 403 khác | Khoá cặp key + model 1 giờ, thử key khác |
 | 5xx, lỗi mạng | Không phạt key, thử key khác |

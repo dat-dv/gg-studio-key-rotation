@@ -501,6 +501,7 @@ export class GeminiProxyController {
         };
 
         if (up.ok) {
+          if (r.probe) await this.quota.probeSucceeded(key.id, limit.modelId);
           if (t.stream && up.body)
             return this.pipeStream(up, res, logId, est, started, routeHeaders);
           const text = await up.text();
