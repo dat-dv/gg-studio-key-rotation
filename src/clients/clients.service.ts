@@ -92,6 +92,19 @@ export class ClientsService {
       )
       .all(quotaDayStart()) as { id: number; n: number; tokens: number }[];
     const byId = new Map(today.map((t) => [t.id, t]));
+    // số request hôm nay của từng client theo model, để UI đặt cạnh quota còn lại của pool
+    const perModel = this.db
+      .prepare(
+        `SELECT client_id AS id, model_id AS modelId, COUNT(*) AS n FROM request_log
+         WHERE ts >= ? AND client_id IS NOT NULL AND status IN ('pending','ok','error') GROUP BY client_id, model_id`,
+      )
+      .all(quotaDayStart()) as { id: number; modelId: string; n: number }[];
+    const usedByModel = new Map<number, Record<string, number>>();
+    for (const r of perModel) {
+      let m = usedByModel.get(r.id);
+      if (!m) usedByModel.set(r.id, (m = {}));
+      m[r.modelId] = r.n;
+    }
     return (this.db.prepare('SELECT * FROM client_keys ORDER BY name COLLATE NOCASE, id').all() as Row[]).map((r) => ({
       id: r.id,
       name: r.name,
@@ -103,6 +116,7 @@ export class ClientsService {
       lastUsedAt: r.last_used_at,
       requestsToday: byId.get(r.id)?.n ?? 0,
       tokensToday: byId.get(r.id)?.tokens ?? 0,
+      usedByModel: usedByModel.get(r.id) ?? {},
     }));
   }
 

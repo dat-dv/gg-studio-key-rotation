@@ -43,6 +43,7 @@ function render() {
   renderClock();
   if (currentTab === 'keys') renderKeys();
   if (currentTab === 'quota') renderQuota();
+  if (currentTab === 'clients') refreshClientQuota();
 }
 
 function renderClock() {
