@@ -69,6 +69,8 @@
   .modelgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 4px 12px; }
   .modelgrid label { display: flex; gap: 6px; align-items: center; color: var(--text); font-size: 13px; margin: 0; cursor: pointer; }
   .modelgrid input { width: auto; }
+  button.chip { border-radius: 999px; padding: 4px 12px; }
+  button.chip.on { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); font-weight: 600; }
   .tokenbox { margin-top: 14px; padding: 12px; border: 1px solid var(--ok); border-radius: 8px; background: var(--code); }
   .tokenbox pre, .snip pre { margin: 8px 0 0; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
   .snip pre { background: var(--code); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
@@ -132,6 +134,8 @@
     <div class="card">
       <h2 id="clientFormTitle">Tạo key cho nơi khác gọi vào gateway</h2>
       <div class="field" style="max-width:420px"><label>Tên (service / người dùng)</label><input id="clientName" placeholder="vd: chatbot-cskh" /></div>
+      <label>Mục đích <span class="hint">— bấm để tự tick các model thuộc loại đó, sau đó vẫn sửa tay được</span></label>
+      <div id="clientPurposes" class="row" style="margin:4px 0 12px"></div>
       <label>Model được phép dùng <span class="hint">— không chọn gì = được dùng mọi model</span></label>
       <div class="hint" style="margin-bottom:6px">Có tick model thì gateway tự quyết được: bên gọi điền tên model bất kỳ (vd <code>auto</code> hoặc tên key), gateway thử lần lượt các model đã tick theo thứ tự trên bảng, model nào hết quota thì sang model kế.</div>
       <div class="row" style="margin:4px 0 8px"><button class="btn sm" id="clientAll">Chọn hết</button><button class="btn sm" id="clientNone">Bỏ chọn</button></div>
@@ -502,10 +506,31 @@ const usableLimits = () => state.limits.filter((l) => !l.unavailableReason);
 function renderClientModels(selected = []) {
   const sel = new Set(selected);
   $('#clientModels').innerHTML = usableLimits().map((l) => `<label title="${esc(l.modelId)}"><input type="checkbox" value="${esc(l.modelId)}" ${sel.has(l.modelId) ? 'checked' : ''} /> ${esc(l.displayName)}</label>`).join('');
+  renderPurposes();
 }
 const checkedModels = () => [...document.querySelectorAll('#clientModels input:checked')].map((i) => i.value);
-$('#clientAll').onclick = () => document.querySelectorAll('#clientModels input').forEach((i) => (i.checked = true));
-$('#clientNone').onclick = () => document.querySelectorAll('#clientModels input').forEach((i) => (i.checked = false));
+const setChecked = (pick) => { document.querySelectorAll('#clientModels input').forEach((i) => (i.checked = pick(i.value))); renderPurposes(); };
+$('#clientAll').onclick = () => setChecked(() => true);
+$('#clientNone').onclick = () => setChecked(() => false);
+/** Hàng "Mục đích": mỗi loại model (chat, embedding, TTS...) một nút, sáng lên khi các model đang tick đúng bằng loại đó. */
+function renderPurposes() {
+  const picked = new Set(checkedModels());
+  const groups = Object.keys(CAPS)
+    .map((cap) => [cap, usableLimits().filter((l) => l.capability === cap).map((l) => l.modelId)])
+    .filter(([, ids]) => ids.length);
+  $('#clientPurposes').innerHTML = groups.map(([cap, ids]) => {
+    const on = picked.size === ids.length && ids.every((m) => picked.has(m));
+    return `<button class="btn sm chip${on ? ' on' : ''}" data-cap="${cap}" title="${esc(CAPS[cap].how)}">${esc(CAPS[cap].label)} <span class="hint">${ids.length}</span></button>`;
+  }).join('') || '<span class="hint">Chưa có model dùng được trong bảng Limits.</span>';
+}
+$('#clientPurposes').onclick = (e) => {
+  const b = e.target.closest('[data-cap]');
+  if (!b) return;
+  const off = b.classList.contains('on'); // bấm lại nút đang sáng = bỏ chọn
+  const ids = new Set(usableLimits().filter((l) => l.capability === b.dataset.cap).map((l) => l.modelId));
+  setChecked((m) => !off && ids.has(m));
+};
+$('#clientModels').onchange = renderPurposes;
 
 async function loadClients() {
   try { clients = await api('/api/clients'); } catch (e) { return toast(e.message); }
