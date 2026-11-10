@@ -4,6 +4,7 @@ import { AdminGuard } from '../common/token.guard';
 import { DatabaseService } from '../db/database.service';
 import { ClientsService } from '../clients/clients.service';
 import { KeysService } from '../keys/keys.service';
+import { isCapability } from '../limits/capability';
 import { LimitsService } from '../limits/limits.service';
 import { QuotaService } from '../router/quota.service';
 
@@ -12,7 +13,7 @@ interface BackupFile {
   version: 1;
   exportedAt: number;
   keys: { apiKey: string; account: string; project: string; note: string; enabled: boolean; disabledReason: string | null; createdAt: number }[];
-  limits: { modelId: string; displayName: string; category: string; rpm: number | null; tpm: number | null; rpd: number | null; aliases: string[]; sortOrder: number }[];
+  limits: { modelId: string; displayName: string; category: string; rpm: number | null; tpm: number | null; rpd: number | null; aliases: string[]; capabilityOverride?: string | null; sortOrder: number }[];
   /** usage & cooldown tham chiếu key bằng chính apiKey vì id ở 2 máy khác nhau */
   /** key cấp cho client: chỉ có hash, không có token gốc */
   clients?: { name: string; tokenHash: string; tokenPrefix: string; allowedModels: string[]; enabled: boolean; createdAt: number; lastUsedAt: number | null }[];
@@ -136,12 +137,12 @@ export class BackupController {
       }
 
       const upLimit = this.db.prepare(
-        `INSERT OR REPLACE INTO model_limits (model_id, display_name, category, rpm, tpm, rpd, aliases, sort_order, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO model_limits (model_id, display_name, category, rpm, tpm, rpd, aliases, capability, sort_order, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const l of body.limits) {
         if (!l?.modelId) continue;
-        upLimit.run(l.modelId, l.displayName || l.modelId, l.category || '', l.rpm ?? null, l.tpm ?? null, l.rpd ?? null, (l.aliases || []).join(','), l.sortOrder ?? 0, Date.now());
+        upLimit.run(l.modelId, l.displayName || l.modelId, l.category || '', l.rpm ?? null, l.tpm ?? null, l.rpd ?? null, (l.aliases || []).join(','), isCapability(l.capabilityOverride) ? l.capabilityOverride : '', l.sortOrder ?? 0, Date.now());
         result.limits++;
       }
 

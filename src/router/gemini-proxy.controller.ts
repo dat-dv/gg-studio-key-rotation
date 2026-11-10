@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { quotaDayEnd } from '../common/time';
 import { ClientContext, ClientsService } from '../clients/clients.service';
 import { KeysService } from '../keys/keys.service';
+import { capabilityMismatch, Operation } from '../limits/capability';
 import { LimitsService } from '../limits/limits.service';
 import { QuotaService } from './quota.service';
 import { classifyUpstreamError, googleError } from './upstream-error';
@@ -35,6 +36,7 @@ type Fmt = 'gemini' | 'openai';
 interface Target {
   model: string;
   fmt: Fmt;
+  op: Operation;
   stream: boolean;
   url: string;
   headers: (apiKey: string) => Record<string, string>;
@@ -113,6 +115,7 @@ export class GeminiProxyController {
     return this.routed(req, res, client, {
       model,
       fmt: 'openai',
+      op: endpoint === 'embeddings' ? 'openai-embeddings' : 'openai-chat',
       stream: req.body?.stream === true,
       url: `${this.base}/v1beta/openai/${endpoint}`,
       headers: (k) => ({ authorization: `Bearer ${k}` }),
@@ -146,6 +149,7 @@ export class GeminiProxyController {
       return this.routed(req, res, client, {
         model: m[2],
         fmt: 'gemini',
+        op: m[3] === 'embedContent' || m[3] === 'batchEmbedContents' ? 'embed' : 'generate',
         stream: m[3] === 'streamGenerateContent',
         url: `${this.base}/${m[1]}/models/${m[2]}:${m[3]}${this.forwardQuery(req)}`,
         headers: (k) => ({ 'x-goog-api-key': k }),
@@ -191,6 +195,9 @@ export class GeminiProxyController {
       return res
         .status(403)
         .json(errBody(t.fmt, 403, 'PERMISSION_DENIED', `Key "${client.name}" không được phép dùng model "${model}". Xem GET /v1/models.`));
+    // chặn trước khi tốn quota: vd gọi model TTS qua chat/completions
+    const mismatch = capabilityMismatch(limit.capability, t.op, model);
+    if (mismatch) return res.status(400).json(errBody(t.fmt, 400, 'INVALID_ARGUMENT', mismatch));
     if (limit.rpm === 0 || limit.tpm === 0 || limit.rpd === 0)
       return res
         .status(429)

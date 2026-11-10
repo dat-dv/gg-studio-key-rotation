@@ -44,6 +44,7 @@ export class DatabaseService implements OnApplicationShutdown {
         tpm INTEGER,
         rpd INTEGER,
         aliases TEXT NOT NULL DEFAULT '',
+        capability TEXT NOT NULL DEFAULT '',
         sort_order INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
       );
@@ -87,6 +88,10 @@ export class DatabaseService implements OnApplicationShutdown {
     `);
     const cols = this.db.prepare(`PRAGMA table_info(request_log)`).all() as { name: string }[];
     if (!cols.some((c) => c.name === 'client_id')) this.db.exec('ALTER TABLE request_log ADD COLUMN client_id INTEGER');
+    // capability sửa tay; '' = tự đoán theo tên/category (xem limits/capability.ts)
+    const limitCols = this.db.prepare(`PRAGMA table_info(model_limits)`).all() as { name: string }[];
+    if (!limitCols.some((c) => c.name === 'capability'))
+      this.db.exec(`ALTER TABLE model_limits ADD COLUMN capability TEXT NOT NULL DEFAULT ''`);
   }
 
   /** Hook cuối cùng khi tắt app: các service khác đã kịp ghi nốt dữ liệu trong onModuleDestroy. */

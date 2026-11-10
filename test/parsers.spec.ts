@@ -4,6 +4,7 @@ import { quotaDayEnd, quotaDayStart } from '../src/common/time';
 import { maskKey, parseCurl } from '../src/keys/curl-parser';
 import { DEFAULT_LIMITS_RAW } from '../src/limits/default-limits';
 import { normalizeModelId, parseLimitsTable, parseQuotaNumber, unusableReason } from '../src/limits/limits-parser';
+import { capabilityMismatch, inferCapability } from '../src/limits/capability';
 import { classifyUpstreamError } from '../src/router/upstream-error';
 
 test('parseCurl: header x-goog-api-key, multi-line', () => {
@@ -81,4 +82,31 @@ test('classifyUpstreamError', () => {
   assert.equal(classifyUpstreamError(400, JSON.stringify({ error: { message: 'API key not valid. Please pass a valid API key.' } })).kind, 'auth');
   assert.equal(classifyUpstreamError(503, 'overloaded').kind, 'transient');
   assert.equal(classifyUpstreamError(400, JSON.stringify({ error: { message: 'bad field' } })).kind, 'client');
+});
+
+test('inferCapability: phân loại model theo tên/category', () => {
+  const caps = Object.fromEntries(parseLimitsTable(DEFAULT_LIMITS_RAW).map((l) => [l.modelId, inferCapability(l)]));
+  assert.equal(caps['gemini-3.8-flash'], 'chat');
+  assert.equal(caps['gemma-4-31b'], 'chat');
+  assert.equal(caps['gemini-robotics-er-2-preview'], 'chat');
+  assert.equal(caps['gemini-2.5-flash-tts'], 'tts');
+  assert.equal(caps['gemini-3.8-flash-lite-tts'], 'tts');
+  assert.equal(caps['gemini-embedding-2'], 'embedding');
+  assert.equal(caps['gemini-2.5-flash-preview-image'], 'image');
+  assert.equal(caps['gemini-3-pro-image'], 'image');
+  assert.equal(caps['lyria-3-pro'], 'other');
+});
+
+test('capabilityMismatch: chặn model gọi nhầm endpoint', () => {
+  assert.equal(capabilityMismatch('chat', 'openai-chat', 'm'), null);
+  assert.equal(capabilityMismatch('chat', 'generate', 'm'), null);
+  assert.equal(capabilityMismatch('tts', 'generate', 'm'), null);
+  assert.equal(capabilityMismatch('embedding', 'openai-embeddings', 'm'), null);
+  assert.equal(capabilityMismatch('embedding', 'embed', 'm'), null);
+  assert.match(capabilityMismatch('tts', 'openai-chat', 'gemini-2.5-flash-tts')!, /responseModalities = \["AUDIO"\]/);
+  assert.ok(capabilityMismatch('image', 'openai-chat', 'm'));
+  assert.ok(capabilityMismatch('embedding', 'openai-chat', 'm'));
+  assert.ok(capabilityMismatch('embedding', 'generate', 'm'));
+  assert.ok(capabilityMismatch('chat', 'openai-embeddings', 'm'));
+  assert.ok(capabilityMismatch('chat', 'embed', 'm'));
 });

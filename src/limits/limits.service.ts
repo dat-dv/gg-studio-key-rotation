@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../db/database.service';
 import { DEFAULT_LIMITS_RAW } from './default-limits';
+import { Capability, inferCapability, isCapability } from './capability';
 import { normalizeModelId, parseLimitsTable, ParsedLimit, unusableReason } from './limits-parser';
 
 export interface ModelLimit {
@@ -11,6 +12,10 @@ export interface ModelLimit {
   tpm: number | null;
   rpd: number | null;
   aliases: string[];
+  /** capability đang áp dụng (sửa tay nếu có, không thì tự đoán) */
+  capability: Capability;
+  /** capability sửa tay; null = tự đoán */
+  capabilityOverride: Capability | null;
   sortOrder: number;
 }
 
@@ -22,6 +27,7 @@ interface Row {
   tpm: number | null;
   rpd: number | null;
   aliases: string;
+  capability: string;
   sort_order: number;
 }
 
@@ -43,16 +49,21 @@ export class LimitsService implements OnModuleInit {
   private load() {
     if (this.cache) return this.cache;
     const rows = this.db.prepare('SELECT * FROM model_limits ORDER BY sort_order, display_name').all() as Row[];
-    const list = rows.map<ModelLimit>((r) => ({
-      modelId: r.model_id,
-      displayName: r.display_name,
-      category: r.category,
-      rpm: r.rpm,
-      tpm: r.tpm,
-      rpd: r.rpd,
-      aliases: r.aliases ? r.aliases.split(',').map((a) => a.trim()).filter(Boolean) : [],
-      sortOrder: r.sort_order,
-    }));
+    const list = rows.map<ModelLimit>((r) => {
+      const override = isCapability(r.capability) ? r.capability : null;
+      return {
+        modelId: r.model_id,
+        displayName: r.display_name,
+        category: r.category,
+        rpm: r.rpm,
+        tpm: r.tpm,
+        rpd: r.rpd,
+        aliases: r.aliases ? r.aliases.split(',').map((a) => a.trim()).filter(Boolean) : [],
+        capability: override ?? inferCapability({ displayName: r.display_name, modelId: r.model_id, category: r.category }),
+        capabilityOverride: override,
+        sortOrder: r.sort_order,
+      };
+    });
     const exact = new Map<string, ModelLimit>();
     const norm = new Map<string, ModelLimit>();
     for (const l of list) {
@@ -118,7 +129,14 @@ export class LimitsService implements OnModuleInit {
       .map((c) => ({ modelId: c.modelId, displayName: c.displayName }));
     return {
       mode,
-      usable: usable.map((u) => ({ modelId: u.modelId, displayName: u.displayName, rpm: u.rpm, tpm: u.tpm, rpd: u.rpd })),
+      usable: usable.map((u) => ({
+        modelId: u.modelId,
+        displayName: u.displayName,
+        rpm: u.rpm,
+        tpm: u.tpm,
+        rpd: u.rpd,
+        capability: this.list().find((c) => c.modelId === u.modelId && mode === 'merge')?.capabilityOverride ?? inferCapability(u),
+      })),
       skipped,
       removed,
     };
@@ -139,7 +157,10 @@ export class LimitsService implements OnModuleInit {
     return { imported: usable.length, skipped, removed, mode };
   }
 
-  update(modelId: string, dto: Partial<Omit<ModelLimit, 'modelId'>> & { newModelId?: string }) {
+  update(
+    modelId: string,
+    dto: Partial<Omit<ModelLimit, 'modelId' | 'capabilityOverride' | 'capability'>> & { newModelId?: string; capability?: string | null },
+  ) {
     const cur = this.list().find((l) => l.modelId === modelId);
     if (!cur) throw new NotFoundException(`Model ${modelId} not found`);
     const num = (v: unknown, fallback: number | null) =>
@@ -152,9 +173,14 @@ export class LimitsService implements OnModuleInit {
       tpm: num(dto.tpm, cur.tpm),
       rpd: num(dto.rpd, cur.rpd),
       aliases: (dto.aliases ?? cur.aliases).map((a) => String(a).trim().toLowerCase()).filter(Boolean).join(','),
+      // '' / null / 'auto' = bỏ sửa tay, quay về tự đoán
+      capability: dto.capability === undefined ? cur.capabilityOverride ?? '' : dto.capability ?? '',
       sortOrder: dto.sortOrder ?? cur.sortOrder,
       now: Date.now(),
     };
+    if (next.capability === 'auto') next.capability = '';
+    if (next.capability && !isCapability(next.capability))
+      throw new BadRequestException(`capability phải là một trong: chat, embedding, tts, image, other (hoặc rỗng = tự đoán)`);
     for (const k of ['rpm', 'tpm', 'rpd'] as const)
       if (next[k] !== null && Number.isNaN(next[k])) throw new BadRequestException(`${k} không hợp lệ`);
     this.db.transaction(() => {
@@ -165,8 +191,8 @@ export class LimitsService implements OnModuleInit {
       }
       this.db
         .prepare(
-          `INSERT OR REPLACE INTO model_limits (model_id, display_name, category, rpm, tpm, rpd, aliases, sort_order, updated_at)
-           VALUES (@modelId, @displayName, @category, @rpm, @tpm, @rpd, @aliases, @sortOrder, @now)`,
+          `INSERT OR REPLACE INTO model_limits (model_id, display_name, category, rpm, tpm, rpd, aliases, capability, sort_order, updated_at)
+           VALUES (@modelId, @displayName, @category, @rpm, @tpm, @rpd, @aliases, @capability, @sortOrder, @now)`,
         )
         .run(next);
     })();
@@ -174,7 +200,7 @@ export class LimitsService implements OnModuleInit {
     return this.list().find((l) => l.modelId === next.modelId);
   }
 
-  create(dto: Partial<ModelLimit>) {
+  create(dto: Partial<Omit<ModelLimit, 'capability'>> & { capability?: string | null }) {
     const modelId = (dto.modelId || '').trim().toLowerCase();
     if (!modelId) throw new BadRequestException('modelId là bắt buộc');
     if (this.list().some((l) => l.modelId === modelId)) throw new BadRequestException('modelId đã tồn tại');

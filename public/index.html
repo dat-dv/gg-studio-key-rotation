@@ -174,7 +174,7 @@
       <h2>Bảng limit free tier (áp cho mỗi project)</h2>
       <p class="hint" style="margin-top:-6px">Model id/alias phải khớp tên model mà client gửi lên (vd <code>gemini-2.5-flash</code>). Router cũng tự khớp các biến thể <code>-preview</code>, <code>-preview-MM-YYYY</code>, <code>-latest</code>, <code>-001</code>.</p>
       <div class="tablewrap"><table>
-        <thead><tr><th>Tên</th><th>Model id</th><th>Alias (phẩy)</th><th>RPM</th><th>TPM</th><th>RPD</th><th></th></tr></thead>
+        <thead><tr><th>Tên</th><th>Model id</th><th>Alias (phẩy)</th><th title="Quyết định model gọi qua endpoint nào">Loại</th><th>RPM</th><th>TPM</th><th>RPD</th><th></th></tr></thead>
         <tbody id="limitsBody"></tbody>
       </table></div>
       <div class="row" style="margin-top:10px"><button class="btn" id="addLimit">+ Thêm model</button></div>
@@ -392,12 +392,25 @@ $('#hideZero').onchange = renderQuota;
 async function clearCdModel(keyId, modelId) { await api(`/api/cooldowns/${keyId}/${encodeURIComponent(modelId)}`, { method: 'DELETE' }); refresh(); }
 
 // ---------- limits ----------
+const CAPS = {
+  chat: { label: 'Chat / text', how: '/v1/chat/completions hoặc :generateContent' },
+  embedding: { label: 'Embedding', how: '/v1/embeddings hoặc :embedContent' },
+  tts: { label: 'TTS (giọng nói)', how: 'chỉ :generateContent, responseModalities ["AUDIO"]' },
+  image: { label: 'Sinh ảnh', how: 'chỉ :generateContent, responseModalities ["IMAGE"]' },
+  other: { label: 'Media khác', how: 'chỉ :generateContent' },
+};
+function capSelect(l) {
+  const opts = Object.entries(CAPS).map(([k, c]) => `<option value="${k}" ${l.capabilityOverride === k ? 'selected' : ''}>${c.label}</option>`).join('');
+  return `<select class="cell" data-f="capability"><option value="" ${l.capabilityOverride ? '' : 'selected'}>Tự đoán: ${CAPS[l.capability].label}</option>${opts}</select>
+    <div class="hint">${esc(CAPS[l.capability].how)}</div>`;
+}
 function renderLimits() {
   const n = (v) => v == null ? '' : v;
   $('#limitsBody').innerHTML = state.limits.map((l) => `<tr data-id="${esc(l.modelId)}">
     <td><input class="cell" data-f="displayName" value="${esc(l.displayName)}" /><div class="hint">${esc(l.category)}</div></td>
     <td><input class="cell mono" data-f="newModelId" value="${esc(l.modelId)}" /></td>
     <td><input class="cell mono" data-f="aliases" value="${esc(l.aliases.join(', '))}" /></td>
+    <td>${capSelect(l)}</td>
     <td><input class="cell" data-f="rpm" value="${n(l.rpm)}" placeholder="∞" style="width:80px" /></td>
     <td><input class="cell" data-f="tpm" value="${n(l.tpm)}" placeholder="∞" style="width:100px" /></td>
     <td><input class="cell" data-f="rpd" value="${n(l.rpd)}" placeholder="∞" style="width:80px" /></td>
@@ -406,7 +419,7 @@ function renderLimits() {
 async function saveLimit(btn) {
   const tr = btn.closest('tr');
   const body = {};
-  tr.querySelectorAll('input[data-f]').forEach((i) => body[i.dataset.f] = i.value.trim());
+  tr.querySelectorAll('input[data-f], select[data-f]').forEach((i) => body[i.dataset.f] = i.value.trim());
   body.aliases = body.aliases ? body.aliases.split(',').map((s) => s.trim()).filter(Boolean) : [];
   for (const f of ['rpm', 'tpm', 'rpd']) body[f] = body[f] === '' ? null : Number(body[f]);
   try { await api(`/api/limits/${encodeURIComponent(tr.dataset.id)}`, { method: 'PATCH', body: JSON.stringify(body) }); toast('Đã lưu'); await refresh(); renderLimits(); } catch (e) { toast(e.message); }
@@ -428,11 +441,14 @@ async function importLimits(mode) {
   box.innerHTML = `
     <b>${mode === 'replace' ? 'Thay toàn bộ bảng limit' : 'Import (merge)'} — xem trước</b>
     <p class="ok" style="margin:8px 0 4px"><b>Sẽ nạp ${p.usable.length} model dùng được:</b></p>
-    <div class="hint">${p.usable.map((u) => esc(u.displayName)).join(' · ') || '(không có)'}</div>
+    ${Object.entries(CAPS).map(([k, c]) => {
+      const names = p.usable.filter((u) => u.capability === k).map((u) => esc(u.displayName));
+      return names.length ? `<div style="margin-bottom:6px"><span class="badge">${esc(c.label)} · ${names.length}</span> <span class="hint">gọi qua ${esc(c.how)}</span><div class="hint">${names.join(' · ')}</div></div>` : '';
+    }).join('') || '<div class="hint">(không có)</div>'}
     ${p.skipped.length ? `<p class="warn" style="margin:12px 0 4px"><b>Sẽ lược bớt ${p.skipped.length} model vì hệ thống không dùng được:</b></p>
       ${Object.entries(groups).map(([reason, names]) => `<div style="margin-bottom:6px"><span class="badge warn">${esc(reason)} · ${names.length}</span><div class="hint">${names.map(esc).join(' · ')}</div></div>`).join('')}` : ''}
     ${p.removed.length ? `<p class="bad" style="margin:12px 0 4px"><b>${p.removed.length} model đang có trong bảng sẽ bị gỡ:</b></p><div class="hint">${p.removed.map((r) => esc(r.displayName)).join(' · ')}</div>` : ''}
-    <p class="hint" style="margin:12px 0 8px">Lịch sử usage không bị xoá.${mode === 'replace' ? ' Alias đã sửa tay sẽ mất.' : ''}</p>
+    <p class="hint" style="margin:12px 0 8px">Lịch sử usage không bị xoá.${mode === 'replace' ? ' Alias và loại model đã sửa tay sẽ mất.' : ''}</p>
     <div class="row"><button class="btn primary" id="importConfirm">Xác nhận import ${p.usable.length} model</button><button class="btn" id="importCancel">Huỷ</button></div>`;
   $('#importCancel').onclick = () => { box.hidden = true; };
   $('#importConfirm').onclick = async () => {
