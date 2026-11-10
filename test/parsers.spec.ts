@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { quotaDayEnd, quotaDayStart } from '../src/common/time';
 import { maskKey, parseCurl } from '../src/keys/curl-parser';
 import { DEFAULT_LIMITS_RAW } from '../src/limits/default-limits';
-import { normalizeModelId, parseLimitsTable, parseQuotaNumber, unusableReason } from '../src/limits/limits-parser';
+import { normalizeModelId, parseLimitsTable, parseQuotaNumber, unsupportedReason, unusableReason } from '../src/limits/limits-parser';
 import { capabilityMismatch, inferCapability } from '../src/limits/capability';
 import { classifyUpstreamError } from '../src/router/upstream-error';
 
@@ -109,4 +109,11 @@ test('capabilityMismatch: chặn model gọi nhầm endpoint', () => {
   assert.ok(capabilityMismatch('embedding', 'generate', 'm'));
   assert.ok(capabilityMismatch('chat', 'openai-embeddings', 'm'));
   assert.ok(capabilityMismatch('chat', 'embed', 'm'));
+});
+
+test('unsupportedReason: chỉ chặn nhóm Live API / Agents, không quan tâm quota', () => {
+  assert.ok(unsupportedReason('Live API'));
+  assert.ok(unsupportedReason(' agents '));
+  assert.equal(unsupportedReason('Multi-modal generative models'), null);
+  assert.equal(unsupportedReason('Text-out models'), null);
 });

@@ -27,11 +27,15 @@ const KNOWN_ALIASES: Record<string, string[]> = {
 /** Nhóm model gateway không phục vụ được: Agents cần Interactions API, Live API chạy qua WebSocket. */
 const UNSUPPORTED_CATEGORIES = new Set(['agents', 'live api']);
 
-/** Vì sao 1 dòng trong bảng AI Studio không dùng được qua gateway; null = dùng được. */
+/** Model thuộc nhóm gateway không gọi được (dù có quota): trả lý do, null = gọi được. */
+export function unsupportedReason(category: string): string | null {
+  return UNSUPPORTED_CATEGORIES.has(category.trim().toLowerCase()) ? `nhóm "${category}" gateway chưa hỗ trợ` : null;
+}
+
+/** Vì sao 1 model chưa dùng được qua gateway; null = dùng được. Model vẫn được nạp vào bảng, chỉ bị đánh dấu. */
 export function unusableReason(l: Pick<ParsedLimit, 'category' | 'rpm' | 'tpm' | 'rpd'>): string | null {
   if (l.rpm === 0 || l.tpm === 0 || l.rpd === 0) return 'không có free tier (limit 0)';
-  if (UNSUPPORTED_CATEGORIES.has(l.category.trim().toLowerCase())) return `nhóm "${l.category}" gateway chưa hỗ trợ`;
-  return null;
+  return unsupportedReason(l.category);
 }
 
 export function parseQuotaNumber(v: string): number | null {

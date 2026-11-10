@@ -54,6 +54,7 @@
   code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
   code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
   .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; }
+  tr.unavail td > *:not(.badge) { opacity: .55; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
   .meter { min-width: 110px; }
   .meter .bar { height: 4px; background: var(--bar); border-radius: 2px; margin-top: 3px; overflow: hidden; }
@@ -146,7 +147,7 @@
     <div class="card">
       <div class="row" style="margin-bottom:12px">
         <div style="min-width:280px;flex:1;max-width:420px"><select id="quotaKey"></select></div>
-        <label class="row" style="margin:0;color:var(--text)"><input type="checkbox" id="hideZero" checked style="width:auto" /> Ẩn model không có free tier</label>
+        <label class="row" style="margin:0;color:var(--text)"><input type="checkbox" id="hideZero" checked style="width:auto" /> Ẩn model chưa dùng được</label>
         <div class="spacer"></div>
         <span class="hint" id="resetIn"></span>
       </div>
@@ -166,7 +167,7 @@
       <div class="row" style="margin-top:8px">
         <button class="btn primary" id="importMerge">Import (merge)</button>
         <button class="btn danger" id="importReplace">Import (thay toàn bộ)</button>
-        <span class="hint">Chỉ nạp model dùng được qua gateway: bỏ qua model limit 0, nhóm Agents, Live API và phần Tools. Usage đã ghi không bị xoá.</span>
+        <span class="hint">Nạp mọi model (bỏ phần Tools). Model limit 0 hoặc thuộc nhóm Agents / Live API được đánh dấu "chưa dùng được" và router chặn khi bị gọi. Usage đã ghi không bị xoá.</span>
       </div>
       <div id="importPreview" class="tokenbox" style="border-color:var(--border)" hidden></div>
     </div>
@@ -357,7 +358,7 @@ function renderQuota() {
 
   const enabled = state.keys.filter((k) => k.enabled);
   const hideZero = $('#hideZero').checked;
-  const limits = state.limits.filter((l) => !hideZero || (l.rpm !== 0 && l.rpd !== 0 && l.tpm !== 0));
+  const limits = state.limits.filter((l) => !hideZero || !l.unavailableReason);
   const single = sel.value !== 'all' ? state.keys.find((k) => String(k.id) === sel.value) : null;
   $('#availHead').textContent = single ? 'Trạng thái' : 'Key còn dùng được';
 
@@ -374,7 +375,8 @@ function renderQuota() {
     const sum = pool.reduce((s, k) => { const u = usageOf(k.id, l.modelId); return { rpm: s.rpm + u.rpm, tpm: s.tpm + u.tpm, rpd: s.rpd + u.rpd }; }, { rpm: 0, tpm: 0, rpd: 0 });
     const mul = (v) => v == null ? null : v * pool.length;
     let last;
-    if (single) {
+    if (l.unavailableReason) last = `<span class="badge muted">${esc(l.unavailableReason)}</span>`;
+    else if (single) {
       const cd = state.cooldowns.find((c) => c.keyId === single.id && c.modelId === l.modelId);
       last = !single.enabled ? '<span class="badge bad">Key tắt</span>'
         : cd ? `<span class="badge warn" title="${esc(cd.reason)}">Cooldown ${dur(cd.until - Date.now())}</span> <button class="btn sm" onclick="clearCdModel(${single.id}, '${esc(l.modelId)}')">Xoá</button>`
@@ -406,8 +408,8 @@ function capSelect(l) {
 }
 function renderLimits() {
   const n = (v) => v == null ? '' : v;
-  $('#limitsBody').innerHTML = state.limits.map((l) => `<tr data-id="${esc(l.modelId)}">
-    <td><input class="cell" data-f="displayName" value="${esc(l.displayName)}" /><div class="hint">${esc(l.category)}</div></td>
+  $('#limitsBody').innerHTML = state.limits.map((l) => `<tr data-id="${esc(l.modelId)}"${l.unavailableReason ? ' class="unavail"' : ''}>
+    <td><input class="cell" data-f="displayName" value="${esc(l.displayName)}" /><div class="hint">${esc(l.category)}</div>${l.unavailableReason ? `<span class="badge warn" style="margin-top:4px">Chưa dùng được: ${esc(l.unavailableReason)}</span>` : ''}</td>
     <td><input class="cell mono" data-f="newModelId" value="${esc(l.modelId)}" /></td>
     <td><input class="cell mono" data-f="aliases" value="${esc(l.aliases.join(', '))}" /></td>
     <td>${capSelect(l)}</td>
@@ -429,34 +431,34 @@ $('#addLimit').onclick = async () => {
   const modelId = prompt('Model id (vd gemini-2.5-flash)'); if (!modelId) return;
   try { await api('/api/limits', { method: 'POST', body: JSON.stringify({ modelId, displayName: modelId }) }); await refresh(); renderLimits(); } catch (e) { toast(e.message); }
 };
-// Bước 1: xem trước -> hiện rõ model nào bị lược bớt và vì sao. Bước 2: người dùng xác nhận mới ghi.
+// Bước 1: xem trước -> model nào dùng được ngay, model nào nạp vào nhưng chưa dùng được và vì sao. Bước 2: người dùng xác nhận mới ghi.
 async function importLimits(mode) {
   const raw = $('#limitsRaw').value;
   const box = $('#importPreview');
   let p;
   try { p = await api('/api/limits/preview', { method: 'POST', body: JSON.stringify({ raw, mode }) }); } catch (e) { box.hidden = true; return toast(e.message); }
   const groups = {};
-  for (const s of p.skipped) (groups[s.reason] ||= []).push(s.displayName);
+  for (const s of p.unavailable) (groups[s.reason] ||= []).push(s.displayName);
   box.hidden = false;
   box.innerHTML = `
     <b>${mode === 'replace' ? 'Thay toàn bộ bảng limit' : 'Import (merge)'} — xem trước</b>
-    <p class="ok" style="margin:8px 0 4px"><b>Sẽ nạp ${p.usable.length} model dùng được:</b></p>
+    <p class="ok" style="margin:8px 0 4px"><b>${p.usable.length} model dùng được ngay:</b></p>
     ${Object.entries(CAPS).map(([k, c]) => {
       const names = p.usable.filter((u) => u.capability === k).map((u) => esc(u.displayName));
       return names.length ? `<div style="margin-bottom:6px"><span class="badge">${esc(c.label)} · ${names.length}</span> <span class="hint">gọi qua ${esc(c.how)}</span><div class="hint">${names.join(' · ')}</div></div>` : '';
     }).join('') || '<div class="hint">(không có)</div>'}
-    ${p.skipped.length ? `<p class="warn" style="margin:12px 0 4px"><b>Sẽ lược bớt ${p.skipped.length} model vì hệ thống không dùng được:</b></p>
+    ${p.unavailable.length ? `<p class="warn" style="margin:12px 0 4px"><b>${p.unavailable.length} model vẫn được nạp nhưng chưa dùng được (router chặn khi bị gọi):</b></p>
       ${Object.entries(groups).map(([reason, names]) => `<div style="margin-bottom:6px"><span class="badge warn">${esc(reason)} · ${names.length}</span><div class="hint">${names.map(esc).join(' · ')}</div></div>`).join('')}` : ''}
     ${p.removed.length ? `<p class="bad" style="margin:12px 0 4px"><b>${p.removed.length} model đang có trong bảng sẽ bị gỡ:</b></p><div class="hint">${p.removed.map((r) => esc(r.displayName)).join(' · ')}</div>` : ''}
     <p class="hint" style="margin:12px 0 8px">Lịch sử usage không bị xoá.${mode === 'replace' ? ' Alias và loại model đã sửa tay sẽ mất.' : ''}</p>
-    <div class="row"><button class="btn primary" id="importConfirm">Xác nhận import ${p.usable.length} model</button><button class="btn" id="importCancel">Huỷ</button></div>`;
+    <div class="row"><button class="btn primary" id="importConfirm">Xác nhận import ${p.usable.length + p.unavailable.length} model</button><button class="btn" id="importCancel">Huỷ</button></div>`;
   $('#importCancel').onclick = () => { box.hidden = true; };
   $('#importConfirm').onclick = async () => {
     try {
       const r = await api('/api/limits/import', { method: 'POST', body: JSON.stringify({ raw, mode }) });
       box.hidden = true;
       $('#limitsRaw').value = '';
-      toast(`Đã import ${r.imported} model, lược bớt ${r.skipped.length} model không dùng được`);
+      toast(`Đã import ${r.imported} model: ${r.usable} dùng được, ${r.unavailable} chưa dùng được`);
       await refresh(); renderLimits();
     } catch (e) { toast(e.message); }
   };
@@ -484,7 +486,7 @@ $('#reloadLogs').onclick = loadLogs;
 // ---------- client keys ----------
 let clients = [];
 let editingClient = null;
-const usableLimits = () => state.limits.filter((l) => l.rpm !== 0 && l.rpd !== 0 && l.tpm !== 0);
+const usableLimits = () => state.limits.filter((l) => !l.unavailableReason);
 function renderClientModels(selected = []) {
   const sel = new Set(selected);
   $('#clientModels').innerHTML = usableLimits().map((l) => `<label title="${esc(l.modelId)}"><input type="checkbox" value="${esc(l.modelId)}" ${sel.has(l.modelId) ? 'checked' : ''} /> ${esc(l.displayName)}</label>`).join('');

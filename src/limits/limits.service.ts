@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from
 import { DatabaseService } from '../db/database.service';
 import { DEFAULT_LIMITS_RAW } from './default-limits';
 import { Capability, inferCapability, isCapability } from './capability';
-import { normalizeModelId, parseLimitsTable, ParsedLimit, unusableReason } from './limits-parser';
+import { normalizeModelId, parseLimitsTable, unusableReason } from './limits-parser';
 
 export interface ModelLimit {
   modelId: string;
@@ -16,6 +16,8 @@ export interface ModelLimit {
   capability: Capability;
   /** capability sửa tay; null = tự đoán */
   capabilityOverride: Capability | null;
+  /** null = gọi được; ngược lại là lý do (limit 0, nhóm Live API / Agents) */
+  unavailableReason: string | null;
   sortOrder: number;
 }
 
@@ -61,6 +63,7 @@ export class LimitsService implements OnModuleInit {
         aliases: r.aliases ? r.aliases.split(',').map((a) => a.trim()).filter(Boolean) : [],
         capability: override ?? inferCapability({ displayName: r.display_name, modelId: r.model_id, category: r.category }),
         capabilityOverride: override,
+        unavailableReason: unusableReason({ category: r.category, rpm: r.rpm, tpm: r.tpm, rpd: r.rpd }),
         sortOrder: r.sort_order,
       };
     });
@@ -104,57 +107,55 @@ export class LimitsService implements OnModuleInit {
   }
 
   /**
-   * Chỉ nạp những model gateway dùng được (limit khác 0, không thuộc nhóm Agents / Live API).
-   * Dòng không dùng được mà đang có trong bảng thì bị gỡ ra. Lịch sử usage (request_log) không bị đụng tới.
+   * Nạp mọi model trong bảng AI Studio. Model chưa dùng được (limit 0, nhóm Agents / Live API) vẫn được nạp
+   * nhưng xếp xuống cuối và bị đánh dấu; router chặn khi bị gọi. Lịch sử usage (request_log) không bị đụng tới.
    */
   private classify(raw: string) {
     const parsed = parseLimitsTable(raw || '');
     if (!parsed.length) throw new BadRequestException('Không parse được dòng model nào từ nội dung đã paste');
-    const usable = parsed.filter((p) => !unusableReason(p)).map((p, i) => ({ ...p, sortOrder: i }));
-    const skipped = parsed
-      .filter((p) => unusableReason(p))
-      .map((p) => ({ modelId: p.modelId, displayName: p.displayName, category: p.category, reason: unusableReason(p)! }));
-    return { usable, skipped };
+    const withReason = parsed.map((p) => ({ ...p, reason: unusableReason(p) }));
+    const ordered = [...withReason.filter((p) => !p.reason), ...withReason.filter((p) => p.reason)];
+    return ordered.map((p, i) => ({ ...p, sortOrder: i }));
   }
 
-  /** Xem trước kết quả import mà không ghi gì: model nào được nạp, model nào bị lược bớt và vì sao. */
+  /** Xem trước kết quả import mà không ghi gì: model nào dùng được ngay, model nào nạp vào nhưng chưa dùng được. */
   preview(raw: string, mode: 'merge' | 'replace' = 'merge') {
-    const { usable, skipped } = this.classify(raw);
-    const current = this.list();
-    const incoming = new Set(usable.map((u) => u.modelId));
-    const skippedIds = new Set(skipped.map((s) => s.modelId));
-    // model đang có trong bảng sẽ biến mất sau import
-    const removed = current
-      .filter((c) => (mode === 'replace' ? !incoming.has(c.modelId) : skippedIds.has(c.modelId)))
-      .map((c) => ({ modelId: c.modelId, displayName: c.displayName }));
+    const rows = this.classify(raw);
+    const current = new Map(this.list().map((c) => [c.modelId, c]));
+    const incoming = new Set(rows.map((r) => r.modelId));
+    // replace: model đang có trong bảng mà bảng mới không có sẽ bị gỡ
+    const removed =
+      mode === 'replace'
+        ? this.list().filter((c) => !incoming.has(c.modelId)).map((c) => ({ modelId: c.modelId, displayName: c.displayName }))
+        : [];
+    const view = (r: (typeof rows)[number]) => ({
+      modelId: r.modelId,
+      displayName: r.displayName,
+      category: r.category,
+      rpm: r.rpm,
+      tpm: r.tpm,
+      rpd: r.rpd,
+      capability: (mode === 'merge' && current.get(r.modelId)?.capabilityOverride) || inferCapability(r),
+    });
     return {
       mode,
-      usable: usable.map((u) => ({
-        modelId: u.modelId,
-        displayName: u.displayName,
-        rpm: u.rpm,
-        tpm: u.tpm,
-        rpd: u.rpd,
-        capability: this.list().find((c) => c.modelId === u.modelId && mode === 'merge')?.capabilityOverride ?? inferCapability(u),
-      })),
-      skipped,
+      usable: rows.filter((r) => !r.reason).map(view),
+      unavailable: rows.filter((r) => r.reason).map((r) => ({ ...view(r), reason: r.reason! })),
       removed,
     };
   }
 
   import(raw: string, mode: 'merge' | 'replace' = 'merge') {
-    const { usable, skipped } = this.classify(raw);
+    const rows = this.classify(raw);
     const stmt = this.upsertStmt();
-    const del = this.db.prepare('DELETE FROM model_limits WHERE model_id = ?');
-    let removed = 0;
     this.db.transaction(() => {
       if (mode === 'replace') this.db.prepare('DELETE FROM model_limits').run();
       const now = Date.now();
-      for (const p of usable) stmt.run({ ...p, aliases: p.aliases.join(','), now });
-      for (const p of skipped) removed += del.run(p.modelId).changes;
+      for (const { reason, ...p } of rows) stmt.run({ ...p, aliases: p.aliases.join(','), now });
     })();
     this.cache = null;
-    return { imported: usable.length, skipped, removed, mode };
+    const unavailable = rows.filter((r) => r.reason).length;
+    return { imported: rows.length, usable: rows.length - unavailable, unavailable, mode };
   }
 
   update(

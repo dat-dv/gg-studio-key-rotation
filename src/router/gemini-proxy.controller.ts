@@ -4,6 +4,7 @@ import { quotaDayEnd } from '../common/time';
 import { ClientContext, ClientsService } from '../clients/clients.service';
 import { KeysService } from '../keys/keys.service';
 import { capabilityMismatch, Operation } from '../limits/capability';
+import { unsupportedReason } from '../limits/limits-parser';
 import { LimitsService } from '../limits/limits.service';
 import { QuotaService } from './quota.service';
 import { classifyUpstreamError, googleError } from './upstream-error';
@@ -195,6 +196,10 @@ export class GeminiProxyController {
       return res
         .status(403)
         .json(errBody(t.fmt, 403, 'PERMISSION_DENIED', `Key "${client.name}" không được phép dùng model "${model}". Xem GET /v1/models.`));
+    // Live API (WebSocket) / Agents (Interactions API): proxy HTTP này không gọi được
+    const unsupported = unsupportedReason(limit.category);
+    if (unsupported)
+      return res.status(400).json(errBody(t.fmt, 400, 'INVALID_ARGUMENT', `Model "${limit.displayName}" thuộc ${unsupported}.`));
     // chặn trước khi tốn quota: vd gọi model TTS qua chat/completions
     const mismatch = capabilityMismatch(limit.capability, t.op, model);
     if (mismatch) return res.status(400).json(errBody(t.fmt, 400, 'INVALID_ARGUMENT', mismatch));
