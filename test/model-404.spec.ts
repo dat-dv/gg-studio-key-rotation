@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import './redis-env';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer, Server } from 'node:http';

@@ -15,6 +15,12 @@ services:
       # Địa chỉ hiện trong lệnh curl mẫu ở màn hình Client keys (không ảnh hưởng tới việc chạy)
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       LOCAL_BASE_URL: ${LOCAL_BASE_URL:-http://gg-studio:3000}
+      # Redis giữ bộ đếm quota + cooldown (bắt buộc). Mặc định dùng service gg-redis bên dưới.
+      REDIS_URL: ${REDIS_URL:-redis://gg-redis:6379}
+      REDIS_PREFIX: ${REDIS_PREFIX:-gg:}
+    depends_on:
+      gg-redis:
+        condition: service_healthy
     volumes:
       - gg-data:/app/data
     networks:
@@ -24,8 +30,23 @@ services:
         aliases:
           - gg-studio
 
+  # Chỉ nằm trên network mặc định của stack này (không gắn vào network dùng chung), không mở cổng ra ngoài.
+  gg-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF: restart Redis không mất bộ đếm hôm nay và cooldown
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - gg-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   gg-data:
+  gg-redis:
 
 networks:
   # Phải có sẵn trước khi deploy: chạy `docker network create proxy_net` một lần trên máy.

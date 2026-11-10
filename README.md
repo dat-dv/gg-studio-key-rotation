@@ -21,10 +21,11 @@ flowchart LR
         A3["Admin<br/>(trình duyệt)"]
     end
 
-    subgraph GW["GG Studio (1 container NestJS)"]
+    subgraph GW["GG Studio (container NestJS + container Redis)"]
         direction TB
         AUTH["Xác thực client key<br/>+ kiểm tra model được phép"]
-        SEL["Chọn key — 100% trong RAM<br/>• key đang bật<br/>• bộ đếm RPM / TPM / RPD<br/>• cooldown"]
+        SEL["Chọn key — 1 script Lua trên Redis<br/>• bộ đếm RPM / TPM / RPD<br/>• hạn mức client · cooldown"]
+        R[("Redis<br/>volume gg-redis")]
         PROXY["Gọi Google<br/>+ failover khi lỗi"]
         Q["Hàng đợi log<br/>(ghi theo lô mỗi 200ms)"]
         UI["UI + Admin API<br/>Keys · Client keys · Quota · Limits · Logs"]
@@ -32,8 +33,9 @@ flowchart LR
 
         AUTH --> SEL --> PROXY
         PROXY -- "kết quả / lỗi 429" --> SEL
+        SEL <--> R
         SEL --> Q --> DB
-        DB -. "nạp 1 lần lúc khởi động" .-> SEL
+        DB -. "chỉ khi Redis trống" .-> R
         UI <--> DB
     end
 
@@ -48,7 +50,7 @@ flowchart LR
 ### Đường đi của một request
 
 1. **Xác thực**: so mã băm của client key với cache trong RAM, kiểm tra model có nằm trong danh sách được phép.
-2. **Chọn key** (không gọi database): lọc các key đang bật, bỏ key đang cooldown hoặc đã chạm RPM/TPM/RPD, rồi lấy key **đã dùng ít nhất** cho model đó (hoà thì xoay vòng). Giữ chỗ ngay trong bộ đếm.
+2. **Chọn key** (một lượt gọi Redis, không có lệnh SQL): script Lua bỏ key đang cooldown hoặc đã chạm RPM/TPM/RPD, lấy key **đã dùng ít nhất** cho model đó (hoà thì xoay vòng) và **cộng bộ đếm ngay** trong cùng script, nên request tới sau luôn thấy số của request tới trước.
 3. **Gọi Google** bằng key vừa chọn.
 4. **Xử lý kết quả**:
 
@@ -64,21 +66,26 @@ flowchart LR
 
 Thử tối đa `MAX_ATTEMPTS` key cho một request. Hết key thì trả 429 kèm `Retry-After`.
 
-### Vì sao RAM + SQLite, không dùng Redis
+### Redis giữ trạng thái quota, SQLite giữ log
 
-- Chọn key trong RAM của chính tiến trình là nhanh nhất có thể: không có lượt gọi mạng nào, kể cả tới Redis.
-- SQLite chỉ để **lưu trữ**: log request được ghi theo lô mỗi 200ms, khi khởi động thì nạp bộ đếm và cooldown từ đó. Build lại hay restart thì số liệu lên như cũ.
-- Đánh đổi: nếu tiến trình bị kill đột ngột thì mất tối đa ~200ms log cuối. Bộ đếm lệch vài request thì Google trả 429 và gateway tự cooldown, nên không gây lỗi cho client.
-- Giới hạn: **chỉ chạy một instance**. Khi cần nhiều replica thì bộ đếm phải dùng chung, lúc đó mới chuyển phần đếm sang Redis.
+- **Redis** (bắt buộc) giữ mọi thứ quyết định việc chọn key: bộ đếm RPM/TPM/RPD theo từng cặp key + model, hạn mức ngày của client key, cooldown, con trỏ xoay vòng. Tiến trình Node không giữ bộ đếm nào trong RAM; key trong Redis tự hết hạn (cửa sổ phút sau 2 phút, bộ đếm ngày sau khi sang ngày).
+- Kiểm tra quota và cộng bộ đếm nằm trong **một script Lua** nên là nguyên tử: 30 request tới cùng lúc không thể cùng lấy slot cuối.
+- **SQLite** chỉ lưu cấu hình (key, limits, client key) và log request cho trang Logs / thống kê. Log được ghi theo lô mỗi 200ms, không nằm trên đường chọn key.
+- Redis trống (lần đầu chạy bản này, hoặc Redis mất dữ liệu) thì lúc khởi động gateway dựng lại bộ đếm hôm nay từ log trong SQLite.
+- Redis không kết nối được: app không khởi động; rớt giữa chừng thì request nhận 503 kèm `Retry-After` thay vì gọi mù lên Google.
+- Vẫn chỉ chạy **một** replica của gateway: bộ đếm đã dùng chung qua Redis, nhưng file SQLite và việc cấp id cho log vẫn thuộc về một tiến trình.
 
 ## Chạy
 
 ### Dev
 
 ```bash
+docker run -d --name gg-redis-dev -p 6379:6379 redis:7-alpine
 npm install
 npm run start:dev
 ```
+
+Gateway cần Redis ở `REDIS_URL` (mặc định `redis://127.0.0.1:6379`). `npm test` cũng cần Redis đó; test dùng prefix riêng nên không đụng dữ liệu dev.
 
 Mở `http://127.0.0.1:3000/`.
 
@@ -93,6 +100,7 @@ docker compose up -d --build
 - Từ ngoài vào: `http://<ip-server>:4041/`
 - Service cùng docker network: `http://gg-studio:3000`
 - Stack khác trên cùng máy (ví dụ Logis): gateway tham gia network dùng chung `proxy_net` với tên `gg-studio`, nên stack nào cũng gắn vào `proxy_net` gọi được `http://gg-studio:3000/v1` mà không đi vòng ra internet. Network này phải có trước khi deploy, tạo một lần bằng `docker network create proxy_net`. Lưu ý `0.0.0.0` chỉ là địa chỉ lắng nghe, container khác không gọi tới nó được.
+- Compose chạy kèm service `gg-redis` (bộ đếm quota, volume `gg-redis`, bật AOF); gateway chờ Redis sẵn sàng rồi mới lên.
 - Dữ liệu nằm trong volume `gg-data`. `docker compose down` giữ dữ liệu; `docker compose down -v` **xoá** dữ liệu.
 
 ### Coolify
@@ -100,10 +108,10 @@ docker compose up -d --build
 1. Tạo Application từ repo này, Build Pack chọn **Docker Compose** (file `docker-compose.yml`).
 2. Vào **Environment Variables → Developer view**, dán nội dung file `.env.coolify` (mẫu: `.env.coolify.example`).
 3. Deploy. Gateway mở ở `http://<ip-server>:4041/`. Nếu gắn domain trong Coolify thì trỏ domain vào cổng container `3000`.
-4. Dữ liệu nằm trong volume `gg-data` khai báo sẵn trong compose, redeploy không mất.
+4. Dữ liệu nằm trong volume `gg-data` và `gg-redis` khai báo sẵn trong compose, redeploy không mất. Redis đi kèm trong compose, không cần tạo riêng; muốn dùng Redis có sẵn thì đặt `REDIS_URL`.
 5. Chuyển dữ liệu từ máy dev lên: **Export** ở máy dev, rồi **Import** trên UI của server.
 
-Chỉ chạy **một** replica (bộ đếm quota nằm trong RAM của tiến trình).
+Chỉ chạy **một** replica của gateway (file SQLite và id log thuộc về một tiến trình).
 
 ## Sử dụng
 
@@ -170,6 +178,8 @@ Nút **Export** tải về file JSON gồm key Google, client keys, limits, usag
 | `PROXY_TOKEN` | trống | Key chủ gọi proxy, dùng mọi model |
 | `MAX_ATTEMPTS` | `4` | Số key tối đa thử cho một request |
 | `DB_PATH` | `./data/gg-studio.db` | File SQLite |
+| `REDIS_URL` | `redis://127.0.0.1:6379` (compose: `redis://gg-redis:6379`) | Redis giữ bộ đếm quota và cooldown, bắt buộc |
+| `REDIS_PREFIX` | `gg:` | Prefix key, đổi khi nhiều môi trường dùng chung một Redis |
 
 Khi chưa đặt `PROXY_TOKEN` và chưa tạo client key nào, proxy mở cho mọi request (tiện dev). Có ít nhất một client key thì bắt buộc phải gửi key.
 
@@ -180,9 +190,10 @@ src/
   keys/      key Google + parser lệnh curl
   limits/    bảng limit free tier + parser bảng AI Studio
   clients/   client key cấp cho nơi dùng
-  router/    chọn key (quota.service), proxy + failover (gemini-proxy.controller)
+  router/    chọn key trên Redis (quota.service), proxy + failover (gemini-proxy.controller)
   backup/    export / import
   db/        SQLite schema
+  redis/     kết nối Redis
   ui/        dashboard: UiController (mỗi trang một URL: /keys /clients /quota /limits /logs), cấu hình view engine
 views/       template Handlebars: layout.hbs, pages/ (mỗi trang một file), partials/header.hbs
 public/      file tĩnh: css/app.css, js/ (mỗi trang một file, core.js dùng chung, app.js khởi động)

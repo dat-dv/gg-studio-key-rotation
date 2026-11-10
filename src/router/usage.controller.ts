@@ -15,8 +15,8 @@ export class UsageController {
 
   /** Toàn bộ số liệu cho dashboard: keys, limits, usage[keyId][modelId], cooldowns. */
   @Get('usage')
-  usage() {
-    return { keys: this.keys.list(), limits: this.limits.list(), ...this.quota.snapshot() };
+  async usage() {
+    return { keys: this.keys.list(), limits: this.limits.list(), ...(await this.quota.snapshot()) };
   }
 
   /** Địa chỉ gợi ý cho lệnh curl mẫu ở màn hình Client keys. */
@@ -34,14 +34,14 @@ export class UsageController {
   }
 
   @Delete('cooldowns/:keyId')
-  clearAll(@Param('keyId', ParseIntPipe) keyId: number) {
-    this.quota.clearCooldown(keyId);
+  async clearAll(@Param('keyId', ParseIntPipe) keyId: number) {
+    await this.quota.clearCooldown(keyId);
     return { ok: true };
   }
 
   @Delete('cooldowns/:keyId/:modelId')
-  clearOne(@Param('keyId', ParseIntPipe) keyId: number, @Param('modelId') modelId: string) {
-    this.quota.clearCooldown(keyId, modelId);
+  async clearOne(@Param('keyId', ParseIntPipe) keyId: number, @Param('modelId') modelId: string) {
+    await this.quota.clearCooldown(keyId, modelId);
     return { ok: true };
   }
 }

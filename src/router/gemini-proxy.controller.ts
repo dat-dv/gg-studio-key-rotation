@@ -395,14 +395,31 @@ export class GeminiProxyController {
       let tries = 0;
       let skipModel = false;
       while (tries < this.maxAttempts) {
-        const r = this.quota.reserve(
-          limit,
-          t.model,
-          est,
-          exclude,
-          client.id,
-          client.dailyLimit,
-        );
+        let r: Awaited<ReturnType<QuotaService["reserve"]>>;
+        try {
+          r = await this.quota.reserve(
+            limit,
+            t.model,
+            est,
+            exclude,
+            client.id,
+            client.dailyLimit,
+          );
+        } catch (e: any) {
+          // Redis giữ bộ đếm quota: không đọc được thì không chọn key an toàn được -> báo 503, không gọi mù lên Google
+          this.log.error(`Redis lỗi khi giữ chỗ quota: ${e?.message || e}`);
+          res.setHeader("Retry-After", "5");
+          return res
+            .status(503)
+            .json(
+              errBody(
+                t.fmt,
+                503,
+                "UNAVAILABLE",
+                "Gateway tạm thời không đọc được bộ đếm quota (Redis). Thử lại sau vài giây.",
+              ),
+            );
+        }
         if (!r.ok) {
           // hạn mức riêng của client key: đổi key Google hay đổi model cũng không gọi tiếp được
           if (r.reason === "client_limit") {
@@ -458,7 +475,7 @@ export class GeminiProxyController {
           });
         } catch (e: any) {
           const msg = e?.message || String(e);
-          this.quota.finalize(logId, {
+          await this.quota.finalize(logId, {
             status: "network_error",
             error: msg,
             latencyMs: Date.now() - started,
@@ -485,7 +502,7 @@ export class GeminiProxyController {
           if (t.stream && up.body)
             return this.pipeStream(up, res, logId, est, started, routeHeaders);
           const text = await up.text();
-          this.quota.finalize(logId, {
+          await this.quota.finalize(logId, {
             status: "ok",
             tokens: lastTotalTokens(text) ?? est,
             httpStatus: up.status,
@@ -518,8 +535,8 @@ export class GeminiProxyController {
               ? quotaDayEnd()
               : Date.now() + Math.max(ce.retryDelayMs ?? 60_000, 5_000);
             const why = `429 ${ce.quotaIds[0] || "RESOURCE_EXHAUSTED"}`;
-            this.quota.setCooldown(key.id, limit.modelId, until, why);
-            this.quota.finalize(logId, {
+            await this.quota.setCooldown(key.id, limit.modelId, until, why);
+            await this.quota.finalize(logId, {
               status: "rate_limited",
               httpStatus: 429,
               error: `${why}: ${ce.message}`,
@@ -535,7 +552,7 @@ export class GeminiProxyController {
               key.id,
               `${ce.reason || up.status}: ${ce.message}`.slice(0, 300),
             );
-            this.quota.finalize(logId, {
+            await this.quota.finalize(logId, {
               status: "auth_error",
               httpStatus: up.status,
               error: ce.message,
@@ -546,13 +563,13 @@ export class GeminiProxyController {
           }
           case "forbidden": {
             // 403 khác (vd model không mở cho project/region này) -> chỉ khoá cặp key+model 1 giờ
-            this.quota.setCooldown(
+            await this.quota.setCooldown(
               key.id,
               limit.modelId,
               Date.now() + 3600_000,
               `403 ${ce.reason || ""}`.trim(),
             );
-            this.quota.finalize(logId, {
+            await this.quota.finalize(logId, {
               status: "auth_error",
               httpStatus: 403,
               error: ce.message,
@@ -562,7 +579,7 @@ export class GeminiProxyController {
           }
           case "transient": {
             // 5xx/overloaded thường là phía model, không phạt key; thử key khác
-            this.quota.finalize(logId, {
+            await this.quota.finalize(logId, {
               status: "upstream_error",
               httpStatus: up.status,
               error: ce.message,
@@ -571,7 +588,7 @@ export class GeminiProxyController {
             continue;
           }
           default: {
-            this.quota.finalize(logId, {
+            await this.quota.finalize(logId, {
               status: "client_error",
               httpStatus: up.status,
               error: ce.message,
@@ -583,8 +600,11 @@ export class GeminiProxyController {
               // request sau bỏ qua luôn, không tốn 1 lượt gọi mỗi request. Sửa model id ở tab Limits
               // hoặc xoá cooldown ở tab Quota thì thử lại ngay.
               const until = Date.now() + MODEL_NOT_FOUND_COOLDOWN_MS;
-              for (const k of this.keys.enabledKeys())
-                this.quota.setCooldown(k.id, limit.modelId, until, "404 model not found");
+              await Promise.all(
+                this.keys
+                  .enabledKeys()
+                  .map((k) => this.quota.setCooldown(k.id, limit.modelId, until, "404 model not found")),
+              );
               this.log.warn(
                 `${limit.modelId}: Google trả 404 -> bỏ qua model này tới ${new Date(until).toISOString()}, kiểm tra lại model id ở tab Limits`,
               );
@@ -677,7 +697,7 @@ export class GeminiProxyController {
     } catch (e: any) {
       this.log.warn(`stream bị ngắt: ${e?.message || e}`);
     } finally {
-      this.quota.finalize(logId, {
+      await this.quota.finalize(logId, {
         status: "ok",
         tokens: tokens ?? est,
         httpStatus: up.status,

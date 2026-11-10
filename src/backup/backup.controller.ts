@@ -41,8 +41,8 @@ export class BackupController {
   }
 
   @Get('export')
-  export(@Query('usage') usage: string | undefined, @Res() res: Response) {
-    this.quota.flush(); // log còn trong RAM phải xuống DB trước khi export
+  async export(@Query('usage') usage: string | undefined, @Res() res: Response) {
+    this.quota.flush(); // log còn trong hàng đợi phải xuống DB trước khi export
     const withUsage = usage !== '0';
     const data: BackupFile = {
       format: 'gg-studio-backup',
@@ -76,12 +76,11 @@ export class BackupController {
            FROM request_log l JOIN api_keys k ON k.id = l.key_id LEFT JOIN client_keys c ON c.id = l.client_id WHERE l.status != 'pending' ORDER BY l.id`,
         )
         .all() as BackupFile['logs'];
-      data.cooldowns = this.db
-        .prepare(
-          `SELECT k.api_key AS apiKey, c.model_id AS modelId, c.until, c.reason
-           FROM cooldowns c JOIN api_keys k ON k.id = c.key_id WHERE c.until > ?`,
-        )
-        .all(Date.now()) as BackupFile['cooldowns'];
+      // cooldown nằm ở Redis; file backup tham chiếu key bằng apiKey
+      const apiKeyById = new Map((this.db.prepare('SELECT id, api_key FROM api_keys').all() as { id: number; api_key: string }[]).map((k) => [k.id, k.api_key]));
+      data.cooldowns = (await this.quota.listCooldowns())
+        .filter((c) => apiKeyById.has(c.keyId))
+        .map((c) => ({ apiKey: apiKeyById.get(c.keyId)!, modelId: c.modelId, until: c.until, reason: c.reason }));
     }
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
     res.setHeader('content-disposition', `attachment; filename="gg-studio-backup-${stamp}.json"`);
@@ -96,7 +95,7 @@ export class BackupController {
    * - logs: bỏ qua dòng đã có (import lại nhiều lần không bị đếm trùng)
    */
   @Post('import')
-  import(@Body() body: BackupFile, @Query('mode') mode?: string) {
+  async import(@Body() body: BackupFile, @Query('mode') mode?: string) {
     if (body?.format !== 'gg-studio-backup' || !Array.isArray(body.keys) || !Array.isArray(body.limits))
       throw new BadRequestException('File không phải backup của gg-studio');
 
@@ -200,7 +199,8 @@ export class BackupController {
     this.limits.invalidate();
     this.keys.invalidate();
     this.clients.invalidate();
-    this.quota.resetCounters();
+    // cooldown vừa ghi tạm vào bảng SQLite ở trên được resetCounters chuyển sang Redis; replace thì bỏ cooldown cũ trong Redis
+    await this.quota.resetCounters(mode === 'replace');
     return { mode: mode === 'replace' ? 'replace' : 'merge', ...result };
   }
 }

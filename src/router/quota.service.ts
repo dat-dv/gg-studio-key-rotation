@@ -1,14 +1,15 @@
-import { BeforeApplicationShutdown, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { BeforeApplicationShutdown, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { quotaDayEnd, quotaDayStart } from '../common/time';
 import { DatabaseService } from '../db/database.service';
 import { ApiKeyRow, KeysService } from '../keys/keys.service';
 import { ModelLimit } from '../limits/limits.service';
+import { RedisService } from '../redis/redis.service';
 
-/** Các trạng thái được tính vào quota local (request đã thực sự tới được model). */
+/** Các trạng thái được tính vào quota (request đã thực sự tới được model). */
 const COUNTED = `('pending','ok','error')`;
 const MINUTE = 60_000;
 const LOG_RETENTION_MS = 3 * 24 * 3600_000;
-/** Chu kỳ ghi log từ RAM xuống DB. Crash thì mất tối đa chừng này số liệu (Google 429 sẽ tự sửa lại). */
+/** Chu kỳ ghi log xuống DB. Crash thì mất tối đa chừng này dòng LOG; bộ đếm quota nằm ở Redis nên không mất. */
 const FLUSH_INTERVAL_MS = 200;
 const FLUSH_MAX_QUEUE = 1000;
 
@@ -21,20 +22,6 @@ export type LogStatus =
   | 'auth_error'
   | 'upstream_error'
   | 'network_error';
-
-export interface Usage {
-  rpm: number;
-  tpm: number;
-  rpd: number;
-  oldestInMinute: number | null;
-}
-
-/** Bộ đếm cho 1 cặp key+model: số request trong ngày + các request trong 60s gần nhất. */
-interface Counter {
-  day: number;
-  rpd: number;
-  win: { id: number; ts: number; tokens: number }[];
-}
 
 interface LogRow {
   id: number;
@@ -56,24 +43,201 @@ export type ReserveResult =
   | { ok: true; key: ApiKeyRow; logId: number }
   | { ok: false; reason: 'no_keys' | 'exhausted' | 'client_limit'; retryAt: number | null; detail: string[] };
 
+/*
+ * Key trong Redis (đều có prefix, mặc định "gg:"; <pair> = "<keyId>|<modelId>"):
+ *   rpd:<dayStart>:<pair>        số request tính quota trong ngày            (hết hạn sau khi sang ngày)
+ *   win:<pair>                   ZSET logId -> ts, các request trong 60s     (TTL 2 phút)
+ *   tok:<pair>                   HASH logId -> token của các request đó      (TTL 2 phút)
+ *   client:<dayStart>:<clientId> số request tính quota hôm nay của client key
+ *   pairs:<dayStart>             SET các pair có số liệu hôm nay (cho dashboard)
+ *   cd:<keyId>                   HASH modelId|"*" -> "<until>|<reason>"
+ *   rr:<modelId>                 con trỏ xoay vòng
+ *   seeded                       đã nạp bộ đếm từ request_log (Redis mới / mất dữ liệu thì nạp lại)
+ */
+
 /**
- * Toàn bộ việc CHỌN KEY chạy trong RAM, không có lệnh DB nào trên đường đi của request:
+ * Giữ chỗ nguyên tử: kiểm tra hạn mức client, duyệt key theo vòng xoay, bỏ key đang cooldown / hết RPD / RPM / TPM,
+ * chọn key ĐÃ DÙNG ÍT NHẤT rồi cộng bộ đếm ngay. Cả đoạn chạy trong 1 script nên request (kể cả từ instance khác)
+ * tới sau luôn thấy số của request tới trước.
+ * ARGV: prefix, now, dayStart, dayEnd, model, estTokens, logId, rpm, tpm, rpd, clientId, clientLimit, rồi (keyId, excluded)*
+ */
+const LUA_RESERVE = `
+local P = ARGV[1]
+local now = tonumber(ARGV[2])
+local dayStart = ARGV[3]
+local dayEnd = tonumber(ARGV[4])
+local model = ARGV[5]
+local est = tonumber(ARGV[6])
+local logId = ARGV[7]
+local rpm, tpm, rpd = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
+local clientId = ARGV[11]
+local clientLimit = tonumber(ARGV[12])
+local BASE = 12
+local n = (#ARGV - BASE) / 2
+local dayTtl = math.floor(dayEnd / 1000) + 3600
+local cut = '(' .. string.format('%d', now - 60000)
+
+if clientId ~= '' and clientLimit then
+  local used = tonumber(redis.call('GET', P .. 'client:' .. dayStart .. ':' .. clientId) or '0')
+  if used >= clientLimit then return {0, 'client_limit', tostring(used)} end
+end
+
+local start = tonumber(redis.call('GET', P .. 'rr:' .. model) or '0') % n
+local retryAt = -1
+local function retry(t) if retryAt < 0 or t < retryAt then retryAt = t end end
+local detail = {}
+local bestIdx, bestRpd, bestRpm = -1, 0, 0
+
+for i = 0, n - 1 do
+  local idx = (start + i) % n
+  local keyId = ARGV[BASE + 1 + idx * 2]
+  if ARGV[BASE + 2 + idx * 2] ~= '1' then
+    local pair = keyId .. '|' .. model
+    local cdKey = P .. 'cd:' .. keyId
+    local cdUntil, cdReason = 0, ''
+    for _, f in ipairs({model, '*'}) do
+      local v = redis.call('HGET', cdKey, f)
+      if v then
+        local sep = string.find(v, '|', 1, true)
+        local u = tonumber(string.sub(v, 1, sep - 1))
+        if u > now then
+          if u > cdUntil then cdUntil = u; cdReason = string.sub(v, sep + 1) end
+        else
+          redis.call('HDEL', cdKey, f)
+        end
+      end
+    end
+    if cdUntil > 0 then
+      retry(cdUntil)
+      detail[#detail + 1] = {idx, 'cooldown', cdReason}
+    else
+      local wk, tk = P .. 'win:' .. pair, P .. 'tok:' .. pair
+      local old = redis.call('ZRANGEBYSCORE', wk, '-inf', cut)
+      if #old > 0 then
+        redis.call('ZREMRANGEBYSCORE', wk, '-inf', cut)
+        redis.call('HDEL', tk, unpack(old))
+      end
+      local uRpd = tonumber(redis.call('GET', P .. 'rpd:' .. dayStart .. ':' .. pair) or '0')
+      local uRpm = redis.call('ZCARD', wk)
+      local uTpm = 0
+      for _, t in ipairs(redis.call('HVALS', tk)) do uTpm = uTpm + tonumber(t) end
+      local oldest = now
+      local first = redis.call('ZRANGE', wk, 0, 0, 'WITHSCORES')
+      if first[2] then oldest = tonumber(first[2]) end
+      if rpd and uRpd >= rpd then
+        retry(dayEnd)
+        detail[#detail + 1] = {idx, 'rpd', tostring(uRpd)}
+      elseif rpm and uRpm >= rpm then
+        retry(oldest + 60000)
+        detail[#detail + 1] = {idx, 'rpm', tostring(uRpm)}
+      elseif tpm and uTpm > 0 and uTpm + est > tpm then
+        -- request lon hon ca TPM van duoc thu khi phut nay chua dung gi (de Google quyet dinh)
+        retry(oldest + 60000)
+        detail[#detail + 1] = {idx, 'tpm', tostring(uTpm)}
+      elseif bestIdx < 0 or uRpd < bestRpd or (uRpd == bestRpd and uRpm < bestRpm) then
+        bestIdx, bestRpd, bestRpm = idx, uRpd, uRpm
+      end
+    end
+  end
+end
+
+if bestIdx < 0 then return {0, 'exhausted', string.format('%d', retryAt), detail} end
+
+local keyId = ARGV[BASE + 1 + bestIdx * 2]
+local pair = keyId .. '|' .. model
+local rk = P .. 'rpd:' .. dayStart .. ':' .. pair
+redis.call('INCR', rk)
+redis.call('EXPIREAT', rk, dayTtl)
+redis.call('ZADD', P .. 'win:' .. pair, now, logId)
+redis.call('HSET', P .. 'tok:' .. pair, logId, est)
+redis.call('PEXPIRE', P .. 'win:' .. pair, 120000)
+redis.call('PEXPIRE', P .. 'tok:' .. pair, 120000)
+redis.call('SADD', P .. 'pairs:' .. dayStart, pair)
+redis.call('EXPIREAT', P .. 'pairs:' .. dayStart, dayTtl)
+if clientId ~= '' then
+  local ck = P .. 'client:' .. dayStart .. ':' .. clientId
+  redis.call('INCR', ck)
+  redis.call('EXPIREAT', ck, dayTtl)
+end
+redis.call('SET', P .. 'rr:' .. model, bestIdx + 1, 'EX', 172800)
+return {1, bestIdx}
+`;
+
+/**
+ * Chốt 1 request. counted=1 (ok/error): giữ chỗ, cập nhật token thật. Ngược lại (Google từ chối, lỗi mạng...):
+ * trả lại chỗ. ARGV: prefix, pair, dayStart (của lúc giữ chỗ), logId, counted, tokens, clientId
+ */
+const LUA_FINALIZE = `
+local P, pair, day, logId, counted, tokens, clientId = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
+local tk = P .. 'tok:' .. pair
+if counted == '1' then
+  if tokens ~= '' and redis.call('HEXISTS', tk, logId) == 1 then redis.call('HSET', tk, logId, tokens) end
+  return 1
+end
+redis.call('ZREM', P .. 'win:' .. pair, logId)
+redis.call('HDEL', tk, logId)
+local rk = P .. 'rpd:' .. day .. ':' .. pair
+if tonumber(redis.call('GET', rk) or '0') > 0 then redis.call('DECR', rk) end
+if clientId ~= '' then
+  local ck = P .. 'client:' .. day .. ':' .. clientId
+  if tonumber(redis.call('GET', ck) or '0') > 0 then redis.call('DECR', ck) end
+end
+return 0
+`;
+
+/** Đặt cooldown, không bao giờ rút ngắn cooldown đang có. ARGV: prefix, keyId, modelId, until, reason, now */
+const LUA_COOLDOWN = `
+local k = ARGV[1] .. 'cd:' .. ARGV[2]
+local untilTs, now = tonumber(ARGV[4]), tonumber(ARGV[6])
+local cur = redis.call('HGET', k, ARGV[3])
+if cur then
+  local u = tonumber(string.sub(cur, 1, string.find(cur, '|', 1, true) - 1))
+  if u > untilTs then untilTs = u end
+end
+redis.call('HSET', k, ARGV[3], string.format('%d', untilTs) .. '|' .. ARGV[5])
+local need = untilTs - now + 60000
+if redis.call('PTTL', k) < need then redis.call('PEXPIRE', k, need) end
+return 1
+`;
+
+/** Số liệu dashboard của mọi pair có hoạt động hôm nay. ARGV: prefix, now, dayStart -> {pair, rpd, rpm, tpm}* */
+const LUA_SNAPSHOT = `
+local P, now, day = ARGV[1], tonumber(ARGV[2]), ARGV[3]
+local cut = '(' .. string.format('%d', now - 60000)
+local out = {}
+for _, pair in ipairs(redis.call('SMEMBERS', P .. 'pairs:' .. day)) do
+  local wk, tk = P .. 'win:' .. pair, P .. 'tok:' .. pair
+  local old = redis.call('ZRANGEBYSCORE', wk, '-inf', cut)
+  if #old > 0 then
+    redis.call('ZREMRANGEBYSCORE', wk, '-inf', cut)
+    redis.call('HDEL', tk, unpack(old))
+  end
+  local tpm = 0
+  for _, t in ipairs(redis.call('HVALS', tk)) do tpm = tpm + tonumber(t) end
+  out[#out + 1] = {pair, redis.call('GET', P .. 'rpd:' .. day .. ':' .. pair) or '0', redis.call('ZCARD', wk), tostring(tpm)}
+end
+return out
+`;
+
+type Scripts = {
+  ggReserve(...args: (string | number)[]): Promise<[1, number] | [0, 'client_limit', string] | [0, 'exhausted', string, [number, string, string][]]>;
+  ggFinalize(...args: (string | number)[]): Promise<number>;
+  ggCooldown(...args: (string | number)[]): Promise<number>;
+  ggSnapshot(...args: (string | number)[]): Promise<[string, string, number, string][]>;
+};
+
+/**
+ * Trạng thái quota nằm hết ở Redis, không giữ trong RAM của process và không có lệnh SQL nào trên đường đi của request:
+ *  - bộ đếm RPM/TPM/RPD, hạn mức client, cooldown, con trỏ xoay vòng: Redis, đọc + cộng trong 1 script Lua (nguyên tử)
  *  - danh sách key đang bật: cache trong KeysService
- *  - bộ đếm RPM/TPM/RPD và cooldown: Map trong service này, nạp từ DB 1 lần lúc khởi động
- *  - log request: đẩy vào hàng đợi, ghi xuống DB theo lô mỗi 200ms (write-behind)
- * DB (SQLite) chỉ còn vai trò lưu trữ để restart/build lại vẫn lên đúng số liệu.
+ *  - log request: hàng đợi nhỏ, ghi xuống SQLite theo lô mỗi 200ms (write-behind) để trang Logs / thống kê đọc
+ * RAM của process chỉ còn các request ĐANG chạy (logId -> dòng log) và hàng đợi log chưa ghi.
  */
 @Injectable()
 export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplicationShutdown {
-  /** con trỏ xoay vòng theo từng model */
-  private readonly rr = new Map<string, number>();
-  private readonly counters = new Map<string, Counter>();
-  /** cooldowns[keyId][modelId] */
-  private readonly cooldowns = new Map<number, Map<string, { until: number; reason: string }>>();
-  /** số request tính quota hôm nay của từng client key (để chặn theo hạn mức riêng) */
-  private readonly clientDay = new Map<number, { day: number; n: number }>();
-  /** request đang chờ kết quả: logId -> bộ đếm đã giữ chỗ + dòng log */
-  private readonly inflight = new Map<number, { c: Counter; row: LogRow }>();
+  private readonly log = new Logger('Quota');
+  /** request đang chờ kết quả: logId -> chỗ đã giữ + dòng log */
+  private readonly inflight = new Map<number, { pair: string; day: number; row: LogRow }>();
   private dayCache = { start: 0, end: 0 };
 
   private nextLogId = 1;
@@ -85,17 +249,36 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   constructor(
     private readonly dbs: DatabaseService,
     private readonly keys: KeysService,
-  ) {}
+    private readonly redis: RedisService,
+  ) {
+    const c = this.redis.client;
+    c.defineCommand('ggReserve', { numberOfKeys: 0, lua: LUA_RESERVE });
+    c.defineCommand('ggFinalize', { numberOfKeys: 0, lua: LUA_FINALIZE });
+    c.defineCommand('ggCooldown', { numberOfKeys: 0, lua: LUA_COOLDOWN });
+    c.defineCommand('ggSnapshot', { numberOfKeys: 0, lua: LUA_SNAPSHOT });
+  }
 
   private get db() {
     return this.dbs.db;
   }
+  private get r() {
+    return this.redis.client;
+  }
+  private get scripts() {
+    return this.redis.client as unknown as Scripts;
+  }
+  private get P() {
+    return this.redis.prefix;
+  }
 
-  onModuleInit() {
+  async onModuleInit() {
+    await this.redis.ready();
     // request treo lại từ lần chạy trước (process bị kill) -> đánh dấu error, vẫn tính quota cho chắc
     this.db.prepare(`UPDATE request_log SET status='error', error='interrupted' WHERE status='pending'`).run();
     this.prune();
-    this.loadFromDb();
+    this.syncLogId();
+    if (!(await this.r.exists(this.P + 'seeded'))) await this.seedFromDb();
+    await this.migrateLegacyCooldowns();
     this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
     this.flushTimer.unref();
     this.pruneTimer = setInterval(() => this.prune(), 3600_000);
@@ -114,16 +297,10 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   }
 
   prune() {
-    const now = Date.now();
-    this.db.prepare('DELETE FROM request_log WHERE ts < ?').run(now - LOG_RETENTION_MS);
-    this.db.prepare('DELETE FROM cooldowns WHERE until < ?').run(now);
-    for (const [keyId, m] of this.cooldowns) {
-      for (const [modelId, c] of m) if (c.until < now) m.delete(modelId);
-      if (!m.size) this.cooldowns.delete(keyId);
-    }
+    this.db.prepare('DELETE FROM request_log WHERE ts < ?').run(Date.now() - LOG_RETENTION_MS);
   }
 
-  // ---------------------------------------------------------------- RAM <-> DB
+  // ---------------------------------------------------------------- Redis <-> DB
 
   private day(now: number) {
     if (now < this.dayCache.start || now >= this.dayCache.end)
@@ -131,41 +308,64 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     return this.dayCache;
   }
 
-  /** Nạp toàn bộ bộ đếm + cooldown từ DB vào RAM (lúc khởi động và sau khi import backup). */
-  private loadFromDb() {
+  private syncLogId() {
+    const { maxId } = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM request_log').get() as { maxId: number };
+    const seq = this.db.prepare(`SELECT seq FROM sqlite_sequence WHERE name='request_log'`).get() as { seq: number } | undefined;
+    this.nextLogId = Math.max(this.nextLogId, maxId + 1, (seq?.seq ?? 0) + 1);
+  }
+
+  /**
+   * Dựng lại bộ đếm trong Redis từ request_log. Chỉ chạy khi Redis chưa có số liệu (lần đầu chuyển sang Redis,
+   * Redis bị xoá trắng) và sau khi import backup; bình thường Redis tự là nguồn số liệu.
+   */
+  private async seedFromDb() {
     const now = Date.now();
-    const day = this.day(now).start;
-    this.counters.clear();
-    this.cooldowns.clear();
-    this.inflight.clear();
-    this.clientDay.clear();
+    const { start, end } = this.day(now);
+    const ttl = Math.floor(end / 1000) + 3600;
+    const P = this.P;
+    const pipe = this.r.pipeline();
 
     const perClient = this.db
       .prepare(`SELECT client_id AS id, COUNT(*) AS n FROM request_log WHERE ts >= ? AND client_id IS NOT NULL AND status IN ${COUNTED} GROUP BY client_id`)
-      .all(day) as { id: number; n: number }[];
-    for (const r of perClient) this.clientDay.set(r.id, { day, n: r.n });
+      .all(start) as { id: number; n: number }[];
+    for (const c of perClient) pipe.set(`${P}client:${start}:${c.id}`, c.n, 'EXAT', ttl);
 
     const daily = this.db
       .prepare(`SELECT key_id, model_id, COUNT(*) AS rpd FROM request_log WHERE ts >= ? AND status IN ${COUNTED} GROUP BY key_id, model_id`)
-      .all(day) as { key_id: number; model_id: string; rpd: number }[];
-    for (const r of daily) this.counters.set(`${r.key_id}|${r.model_id}`, { day, rpd: r.rpd, win: [] });
+      .all(start) as { key_id: number; model_id: string; rpd: number }[];
+    for (const d of daily) {
+      const pair = `${d.key_id}|${d.model_id}`;
+      pipe.set(`${P}rpd:${start}:${pair}`, d.rpd, 'EXAT', ttl);
+      pipe.sadd(`${P}pairs:${start}`, pair);
+    }
+    if (daily.length) pipe.expireat(`${P}pairs:${start}`, ttl);
 
     const recent = this.db
       .prepare(`SELECT id, key_id, model_id, ts, tokens FROM request_log WHERE ts >= ? AND status IN ${COUNTED} ORDER BY ts`)
       .all(now - MINUTE) as { id: number; key_id: number; model_id: string; ts: number; tokens: number }[];
-    for (const r of recent) this.counter(r.key_id, r.model_id, now).win.push({ id: r.id, ts: r.ts, tokens: r.tokens });
+    for (const w of recent) {
+      const pair = `${w.key_id}|${w.model_id}`;
+      pipe.zadd(`${P}win:${pair}`, w.ts, String(w.id));
+      pipe.hset(`${P}tok:${pair}`, String(w.id), w.tokens);
+      pipe.pexpire(`${P}win:${pair}`, 2 * MINUTE);
+      pipe.pexpire(`${P}tok:${pair}`, 2 * MINUTE);
+      pipe.sadd(`${P}pairs:${start}`, pair);
+    }
+    pipe.set(`${P}seeded`, String(now), 'EX', 7 * 86400);
+    await pipe.exec();
+    this.log.log(`Nạp bộ đếm vào Redis từ request_log: ${daily.length} cặp key+model, ${perClient.length} client`);
+  }
 
-    const cds = this.db.prepare('SELECT key_id, model_id, until, reason FROM cooldowns WHERE until > ?').all(now) as {
+  /** Cooldown từng lưu trong SQLite (bản trước khi dùng Redis, hoặc vừa import backup) -> chuyển sang Redis rồi xoá. */
+  private async migrateLegacyCooldowns() {
+    const rows = this.db.prepare('SELECT key_id, model_id, until, reason FROM cooldowns WHERE until > ?').all(Date.now()) as {
       key_id: number;
       model_id: string;
       until: number;
       reason: string;
     }[];
-    for (const c of cds) this.cooldownMap(c.key_id).set(c.model_id, { until: c.until, reason: c.reason });
-
-    const { maxId } = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM request_log').get() as { maxId: number };
-    const seq = this.db.prepare(`SELECT seq FROM sqlite_sequence WHERE name='request_log'`).get() as { seq: number } | undefined;
-    this.nextLogId = Math.max(maxId, seq?.seq ?? 0) + 1;
+    for (const c of rows) await this.setCooldown(c.key_id, c.model_id, c.until, c.reason);
+    this.db.prepare('DELETE FROM cooldowns').run();
   }
 
   /** Ghi hàng đợi log xuống DB trong 1 transaction. An toàn khi gọi bất cứ lúc nào. */
@@ -196,100 +396,76 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     }
   }
 
-  /** Ghi hết hàng đợi rồi nạp lại RAM từ DB. Gọi sau khi DB bị sửa từ bên ngoài (import backup). */
-  resetCounters() {
+
+  /**
+   * Gọi sau khi DB bị sửa từ bên ngoài (import backup): ghi hết hàng đợi log, xoá bộ đếm trong Redis rồi dựng lại
+   * từ request_log. Cooldown trong Redis giữ nguyên trừ khi wipeCooldowns (import kiểu replace).
+   */
+  async resetCounters(wipeCooldowns = false) {
     this.flush();
-    this.loadFromDb();
-  }
-
-  // ---------------------------------------------------------------- bộ đếm
-
-  private counter(keyId: number, modelId: string, now: number): Counter {
-    const day = this.day(now).start;
-    const id = `${keyId}|${modelId}`;
-    let c = this.counters.get(id);
-    if (!c) this.counters.set(id, (c = { day, rpd: 0, win: [] }));
-    else if (c.day !== day) {
-      // sang ngày mới (00:00 Pacific): RPD về 0, cửa sổ 60s giữ nguyên
-      c.day = day;
-      c.rpd = 0;
+    this.inflight.clear();
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', ...(wipeCooldowns ? ['cd:*'] : [])];
+    for (const p of patterns) {
+      const keys = await this.redis.scan(p);
+      for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
     }
-    const cut = now - MINUTE;
-    let drop = 0;
-    while (drop < c.win.length && c.win[drop].ts < cut) drop++;
-    if (drop) c.win.splice(0, drop);
-    return c;
-  }
-
-  usage(keyId: number, modelId: string, now = Date.now()): Usage {
-    const c = this.counter(keyId, modelId, now);
-    let tpm = 0;
-    for (const w of c.win) tpm += w.tokens;
-    return { rpm: c.win.length, tpm, rpd: c.rpd, oldestInMinute: c.win.length ? c.win[0].ts : null };
-  }
-
-  private clientCounter(clientId: number, now: number) {
-    const day = this.day(now).start;
-    let c = this.clientDay.get(clientId);
-    if (!c || c.day !== day) this.clientDay.set(clientId, (c = { day, n: 0 }));
-    return c;
-  }
-
-  /** Số request tính quota hôm nay của một client key (gồm cả request đang chạy). */
-  clientUsed(clientId: number, now = Date.now()) {
-    return this.clientCounter(clientId, now).n;
+    this.syncLogId();
+    await this.seedFromDb();
+    await this.migrateLegacyCooldowns();
   }
 
   // ---------------------------------------------------------------- cooldown
 
-  private cooldownMap(keyId: number) {
-    let m = this.cooldowns.get(keyId);
-    if (!m) this.cooldowns.set(keyId, (m = new Map()));
-    return m;
-  }
-
-  cooldown(keyId: number, modelId: string, now = Date.now()) {
-    const m = this.cooldowns.get(keyId);
-    if (!m) return null;
-    let best: { until: number; reason: string } | null = null;
-    for (const id of [modelId, '*']) {
-      const c = m.get(id);
-      if (c && c.until > now && (!best || c.until > best.until)) best = c;
+  /** Không ném lỗi: cooldown chỉ là tối ưu, Redis trục trặc thì request sau sẽ bị Google từ chối lại và đặt lại. */
+  async setCooldown(keyId: number, modelId: string, until: number, reason: string) {
+    try {
+      await this.scripts.ggCooldown(this.P, keyId, modelId, Math.floor(until), reason.replace(/\s+/g, ' ').slice(0, 300), Date.now());
+    } catch (e: any) {
+      this.log.error(`setCooldown #${keyId} ${modelId}: ${e?.message || e}`);
     }
-    return best;
   }
 
-  setCooldown(keyId: number, modelId: string, until: number, reason: string) {
-    const m = this.cooldownMap(keyId);
-    const next = { until: Math.max(until, m.get(modelId)?.until ?? 0), reason };
-    m.set(modelId, next);
-    // ghi DB ngay: chỉ xảy ra khi Google trả lỗi, không nằm trên đường chọn key
-    this.db
-      .prepare(
-        `INSERT INTO cooldowns (key_id, model_id, until, reason) VALUES (?, ?, ?, ?)
-         ON CONFLICT(key_id, model_id) DO UPDATE SET until=excluded.until, reason=excluded.reason`,
-      )
-      .run(keyId, modelId, next.until, reason);
+  async clearCooldown(keyId: number, modelId?: string) {
+    if (modelId) await this.r.hdel(`${this.P}cd:${keyId}`, modelId);
+    else await this.r.del(`${this.P}cd:${keyId}`);
   }
 
-  clearCooldown(keyId: number, modelId?: string) {
-    if (modelId) {
-      this.cooldowns.get(keyId)?.delete(modelId);
-      this.db.prepare('DELETE FROM cooldowns WHERE key_id=? AND model_id=?').run(keyId, modelId);
-    } else {
-      this.cooldowns.delete(keyId);
-      this.db.prepare('DELETE FROM cooldowns WHERE key_id=?').run(keyId);
-    }
+  /** Bỏ cooldown của 1 model trên mọi key (model bị đổi id / sửa ở tab Limits). */
+  async clearModelCooldowns(modelId: string) {
+    const keys = await this.redis.scan('cd:*');
+    if (!keys.length) return;
+    const pipe = this.r.pipeline();
+    for (const k of keys) pipe.hdel(k, modelId);
+    await pipe.exec();
+  }
+
+  /** Mọi cooldown còn hiệu lực (dashboard, export backup). */
+  async listCooldowns(now = Date.now()) {
+    const out: { keyId: number; modelId: string; until: number; reason: string }[] = [];
+    const keys = await this.redis.scan('cd:*');
+    if (!keys.length) return out;
+    const pipe = this.r.pipeline();
+    for (const k of keys) pipe.hgetall(k);
+    const res = (await pipe.exec()) ?? [];
+    keys.forEach((k, i) => {
+      const keyId = Number(k.slice(k.lastIndexOf(':') + 1));
+      for (const [modelId, v] of Object.entries((res[i]?.[1] as Record<string, string>) || {})) {
+        const sep = v.indexOf('|');
+        const until = Number(v.slice(0, sep));
+        if (until > now) out.push({ keyId, modelId, until, reason: v.slice(sep + 1) });
+      }
+    });
+    return out;
   }
 
   // ---------------------------------------------------------------- chọn key
 
   /**
    * Chọn key chia đều (ít dùng nhất, hoà thì xoay vòng), chỉ xét key còn quota, và giữ chỗ luôn.
-   * Hàm này KHÔNG gọi DB và không có await -> chạy nguyên khối trên event loop,
-   * nên 2 request đồng thời không thể cùng lấy 1 slot cuối.
+   * Việc kiểm tra + cộng bộ đếm chạy trong 1 script Lua trên Redis nên 2 request đồng thời
+   * (kể cả ở 2 instance) không thể cùng lấy 1 slot cuối. Redis lỗi -> ném ra, router trả 503.
    */
-  reserve(
+  async reserve(
     limit: ModelLimit,
     requestedModel: string,
     estTokens: number,
@@ -297,62 +473,49 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     clientId: number | null = null,
     /** hạn mức request/ngày của client key; null = không giới hạn riêng */
     clientLimit: number | null = null,
-  ): ReserveResult {
+  ): Promise<ReserveResult> {
     const now = Date.now();
-    // kiểm tra trong cùng khối đồng bộ với việc giữ chỗ -> 2 request đồng thời không cùng lấy slot cuối
-    if (clientId != null && clientLimit != null) {
-      const used = this.clientCounter(clientId, now).n;
-      if (used >= clientLimit)
-        return { ok: false, reason: 'client_limit', retryAt: this.day(now).end, detail: [`hết hạn mức ${used}/${clientLimit} request hôm nay`] };
-    }
+    const { start, end } = this.day(now);
     const keys = this.keys.enabledKeys();
     if (!keys.length) return { ok: false, reason: 'no_keys', retryAt: null, detail: ['Chưa có key nào đang bật'] };
 
-    const n = keys.length;
-    const start = (this.rr.get(limit.modelId) ?? 0) % n;
-    let retryAt = Infinity;
-    const detail: string[] = [];
-    let best: { idx: number; key: ApiKeyRow; u: Usage } | null = null;
+    const logId = this.nextLogId++;
+    const num = (v: number | null) => (v === null ? '' : v);
+    const res = await this.scripts.ggReserve(
+      this.P,
+      now,
+      start,
+      end,
+      limit.modelId,
+      estTokens,
+      logId,
+      num(limit.rpm),
+      num(limit.tpm),
+      num(limit.rpd),
+      clientId != null && clientLimit != null ? clientId : '',
+      num(clientLimit),
+      ...keys.flatMap((k) => [k.id, exclude.has(k.id) ? 1 : 0]),
+    );
 
-    // Duyệt theo thứ tự xoay vòng, lọc key còn quota, rồi chọn key ĐÃ DÙNG ÍT NHẤT
-    // (RPD hôm nay, rồi RPM phút này). Hoà nhau thì key đứng trước trong vòng xoay thắng.
-    for (let i = 0; i < n; i++) {
-      const idx = (start + i) % n;
-      const k = keys[idx];
-      if (exclude.has(k.id)) continue;
-      const label = `${k.account}/${k.project}`;
-
-      const cd = this.cooldown(k.id, limit.modelId, now);
-      if (cd) {
-        retryAt = Math.min(retryAt, cd.until);
-        detail.push(`${label}: cooldown (${cd.reason})`);
-        continue;
-      }
-      const u = this.usage(k.id, limit.modelId, now);
-      if (limit.rpd !== null && u.rpd >= limit.rpd) {
-        retryAt = Math.min(retryAt, this.day(now).end);
-        detail.push(`${label}: hết RPD ${u.rpd}/${limit.rpd}`);
-        continue;
-      }
-      if (limit.rpm !== null && u.rpm >= limit.rpm) {
-        retryAt = Math.min(retryAt, (u.oldestInMinute ?? now) + MINUTE);
-        detail.push(`${label}: hết RPM ${u.rpm}/${limit.rpm}`);
-        continue;
-      }
-      // request lớn hơn cả TPM thì vẫn cho thử khi phút này chưa dùng gì (để Google quyết định)
-      if (limit.tpm !== null && u.tpm > 0 && u.tpm + estTokens > limit.tpm) {
-        retryAt = Math.min(retryAt, (u.oldestInMinute ?? now) + MINUTE);
-        detail.push(`${label}: hết TPM ${u.tpm}+~${estTokens}/${limit.tpm}`);
-        continue;
-      }
-      if (!best || u.rpd < best.u.rpd || (u.rpd === best.u.rpd && u.rpm < best.u.rpm)) best = { idx, key: k, u };
+    if (res[0] === 0) {
+      if (res[1] === 'client_limit')
+        return { ok: false, reason: 'client_limit', retryAt: end, detail: [`hết hạn mức ${res[2]}/${clientLimit} request hôm nay`] };
+      const retryAt = Number(res[2]);
+      const detail = res[3].map(([idx, kind, v]) => {
+        const k = keys[idx];
+        const label = `${k.account}/${k.project}`;
+        if (kind === 'cooldown') return `${label}: cooldown (${v})`;
+        if (kind === 'rpd') return `${label}: hết RPD ${v}/${limit.rpd}`;
+        if (kind === 'rpm') return `${label}: hết RPM ${v}/${limit.rpm}`;
+        return `${label}: hết TPM ${v}+~${estTokens}/${limit.tpm}`;
+      });
+      return { ok: false, reason: 'exhausted', retryAt: retryAt > 0 ? retryAt : null, detail };
     }
 
-    if (!best) return { ok: false, reason: 'exhausted', retryAt: Number.isFinite(retryAt) ? retryAt : null, detail };
-
+    const key = keys[res[1]];
     const row: LogRow = {
-      id: this.nextLogId++,
-      keyId: best.key.id,
+      id: logId,
+      keyId: key.id,
       modelId: limit.modelId,
       requestedModel,
       ts: now,
@@ -364,25 +527,21 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       clientId,
       queued: true,
     };
-    const c = this.counter(best.key.id, limit.modelId, now);
-    c.rpd++;
-    c.win.push({ id: row.id, ts: now, tokens: estTokens });
-    if (clientId != null) this.clientCounter(clientId, now).n++;
-    this.inflight.set(row.id, { c, row });
+    this.inflight.set(logId, { pair: `${key.id}|${limit.modelId}`, day: start, row });
     this.insertQueue.push(row);
     if (this.insertQueue.length === FLUSH_MAX_QUEUE) setImmediate(() => this.flush());
-    this.rr.set(limit.modelId, best.idx + 1);
-    return { ok: true, key: best.key, logId: row.id };
+    return { ok: true, key, logId };
   }
 
-  finalize(
+  /** Chốt kết quả 1 request: sửa dòng log, và trả lại chỗ trong Redis nếu request không tính quota. Không ném lỗi. */
+  async finalize(
     logId: number,
     p: { status: LogStatus; tokens?: number | null; httpStatus?: number; error?: string | null; latencyMs?: number },
   ) {
     const f = this.inflight.get(logId);
-    if (!f) return; // bộ đếm đã bị nạp lại (import backup) trong lúc request đang chạy
+    if (!f) return; // bộ đếm đã bị dựng lại (import backup) trong lúc request đang chạy
     this.inflight.delete(logId);
-    const { c, row } = f;
+    const { row } = f;
 
     // Dòng log còn trong hàng đợi insert thì sửa tại chỗ (chỉ 1 lệnh ghi); đã xuống DB thì xếp thêm 1 update.
     row.status = p.status;
@@ -392,36 +551,28 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     row.latencyMs = p.latencyMs ?? null;
     if (!row.queued) this.updateQueue.push(row);
 
-    // Bộ đếm: request không tính quota thì trả lại chỗ, request ok thì cập nhật token thật
-    const i = c.win.findIndex((w) => w.id === logId);
-    if (p.status === 'ok' || p.status === 'error') {
-      if (i >= 0 && p.tokens != null) c.win[i].tokens = p.tokens;
-    } else {
-      if (i >= 0) c.win.splice(i, 1);
-      if (c.day === this.day(row.ts).start) c.rpd = Math.max(0, c.rpd - 1);
-      const cc = row.clientId != null ? this.clientDay.get(row.clientId) : undefined;
-      if (cc && cc.day === this.day(row.ts).start) cc.n = Math.max(0, cc.n - 1);
+    const counted = p.status === 'ok' || p.status === 'error';
+    if (counted && p.tokens == null) return; // giữ nguyên chỗ và số token ước lượng
+    try {
+      await this.scripts.ggFinalize(this.P, f.pair, f.day, logId, counted ? 1 : 0, p.tokens ?? '', row.clientId ?? '');
+    } catch (e: any) {
+      this.log.error(`finalize #${logId}: ${e?.message || e}`);
     }
   }
 
   // ---------------------------------------------------------------- dashboard
 
-  /** Số liệu cho dashboard, lấy thẳng từ RAM: usage[keyId][modelId] */
-  snapshot() {
+  /** Số liệu cho dashboard, đọc từ Redis: usage[keyId][modelId] */
+  async snapshot() {
     const now = Date.now();
     const { start, end } = this.day(now);
     const usage: Record<number, Record<string, { rpm: number; tpm: number; rpd: number }>> = {};
-    for (const id of this.counters.keys()) {
-      const sep = id.indexOf('|');
-      const keyId = Number(id.slice(0, sep));
-      const modelId = id.slice(sep + 1);
-      const u = this.usage(keyId, modelId, now);
-      if (u.rpd || u.rpm) (usage[keyId] ||= {})[modelId] = { rpm: u.rpm, tpm: u.tpm, rpd: u.rpd };
+    for (const [pair, rpd, rpm, tpm] of await this.scripts.ggSnapshot(this.P, now, start)) {
+      const sep = pair.indexOf('|');
+      const u = { rpm: Number(rpm), tpm: Number(tpm), rpd: Number(rpd) };
+      if (u.rpd || u.rpm) (usage[Number(pair.slice(0, sep))] ||= {})[pair.slice(sep + 1)] = u;
     }
-    const cooldowns: { keyId: number; modelId: string; until: number; reason: string }[] = [];
-    for (const [keyId, m] of this.cooldowns)
-      for (const [modelId, c] of m) if (c.until > now) cooldowns.push({ keyId, modelId, until: c.until, reason: c.reason });
-    return { now, dayStart: start, dayEnd: end, usage, cooldowns };
+    return { now, dayStart: start, dayEnd: end, usage, cooldowns: await this.listCooldowns(now) };
   }
 
   /** Một trang log, mới nhất trước. page bắt đầu từ 1; page vượt quá thì trả trang cuối. */

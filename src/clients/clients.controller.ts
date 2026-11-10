@@ -13,7 +13,7 @@ export class ClientsController {
 
   @Get()
   list() {
-    // số đã dùng hôm nay đọc từ request_log: ghi nốt log còn trong hàng đợi để khớp với bộ đếm hạn mức trong RAM
+    // số đã dùng hôm nay đọc từ request_log: ghi nốt log còn trong hàng đợi để khớp với bộ đếm hạn mức trong Redis
     this.quota.flush();
     return this.clients.list();
   }

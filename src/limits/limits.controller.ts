@@ -1,11 +1,15 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import { AdminGuard } from '../common/token.guard';
+import { QuotaService } from '../router/quota.service';
 import { LimitsService } from './limits.service';
 
 @UseGuards(AdminGuard)
 @Controller('api/limits')
 export class LimitsController {
-  constructor(private readonly limits: LimitsService) {}
+  constructor(
+    private readonly limits: LimitsService,
+    private readonly quota: QuotaService,
+  ) {}
 
   @Get()
   list() {
@@ -30,8 +34,14 @@ export class LimitsController {
   }
 
   @Patch(':modelId')
-  update(@Param('modelId') modelId: string, @Body() body: any) {
-    return this.limits.update(modelId, body || {});
+  async update(@Param('modelId') modelId: string, @Body() body: any) {
+    const updated = this.limits.update(modelId, body || {});
+    if (updated && updated.modelId !== modelId) {
+      // đổi model id: request_log đã theo id mới -> dựng lại bộ đếm Redis theo id mới, bỏ cooldown của id cũ
+      await this.quota.clearModelCooldowns(modelId);
+      await this.quota.resetCounters();
+    }
+    return updated;
   }
 
   @Delete(':modelId')
