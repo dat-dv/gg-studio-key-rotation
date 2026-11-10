@@ -1,0 +1,24 @@
+<section id="tab-clients">
+  <div class="card">
+    <h2 id="clientFormTitle">Tạo key cho nơi khác gọi vào gateway</h2>
+    <div class="field" style="max-width:420px"><label>Tên (service / người dùng)</label><input id="clientName" placeholder="vd: chatbot-cskh" /></div>
+    <label>Mục đích <span class="hint">— bấm để tự tick các model thuộc loại đó, sau đó vẫn sửa tay được</span></label>
+    <div id="clientPurposes" class="row" style="margin:4px 0 12px"></div>
+    <label>Model được phép dùng <span class="hint">— không chọn gì = được dùng mọi model</span></label>
+    <div class="hint" style="margin-bottom:6px">Có tick model thì gateway tự quyết được: bên gọi điền tên model bất kỳ (vd <code>auto</code> hoặc tên key), gateway thử lần lượt các model đã tick theo thứ tự trên bảng, model nào hết quota thì sang model kế.</div>
+    <div class="row" style="margin:4px 0 8px"><button class="btn sm" id="clientAll">Chọn hết</button><button class="btn sm" id="clientNone">Bỏ chọn</button></div>
+    <div id="clientModels" class="modelgrid"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" id="clientSave">Tạo key</button>
+      <button class="btn" id="clientCancel" hidden>Huỷ sửa</button>
+    </div>
+    <div id="clientToken" class="tokenbox" hidden></div>
+  </div>
+  <div class="card">
+    <h2>Client keys <span class="hint" id="clientAuthHint"></span></h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Tên</th><th>Key</th><th>Model được phép</th><th>Hôm nay</th><th>Dùng lần cuối</th><th></th></tr></thead>
+      <tbody id="clientsBody"></tbody>
+    </table></div>
+  </div>
+</section>

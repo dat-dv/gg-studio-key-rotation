@@ -25,6 +25,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY public ./public
+COPY views ./views
 RUN mkdir -p /app/data && chown -R node:node /app/data
 USER node
 VOLUME /app/data

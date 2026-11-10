@@ -1,0 +1,25 @@
+<section id="tab-keys" class="active">
+  <div class="grid">
+    <div class="card">
+      <h2>Thêm key — paste lệnh curl hoặc key</h2>
+      <div class="field">
+        <textarea id="curl" rows="9" placeholder="curl &quot;https://generativelanguage.googleapis.com/v1beta/models/...:generateContent&quot; -H 'X-goog-api-key: ...' ..."></textarea>
+      </div>
+      <div id="parsePreview" class="hint">Paste curl để xem key được trích ra.</div>
+    </div>
+    <div class="card">
+      <h2>Gắn nhãn</h2>
+      <div class="field"><label>Account</label><input id="account" list="accountList" placeholder="datdoan.dev" /><datalist id="accountList"></datalist></div>
+      <div class="field"><label>Project</label><input id="project" placeholder="gg-project-01" /></div>
+      <div class="field"><label>Ghi chú (tuỳ chọn)</label><input id="note" /></div>
+      <div class="row"><button class="btn primary" id="addKey">Lưu key</button><span class="hint">1 project = 1 key (quota tính theo project)</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Danh sách key <span class="hint" id="keyCount"></span></h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Project</th><th>Key</th><th>Trạng thái</th><th>Hôm nay</th><th>Ghi chú</th><th></th></tr></thead>
+      <tbody id="keysBody"></tbody>
+    </table></div>
+  </div>
+</section>

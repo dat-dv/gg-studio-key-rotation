@@ -1,0 +1,13 @@
+<header>
+  <h1>GG Studio · Gemini Key Pool</h1>
+  <nav>
+    {{#each tabs}}
+    <button data-tab="{{id}}"{{#if @first}} class="active"{{/if}}>{{label}}</button>
+    {{/each}}
+  </nav>
+  <div class="spacer"></div>
+  <button class="btn sm" id="exportBtn" title="Tải file JSON chứa key, limits, usage">Export</button>
+  <button class="btn sm" id="importBtn" title="Nạp file backup (merge, không xoá dữ liệu đang có)">Import</button>
+  <input type="file" id="importFile" accept="application/json,.json" hidden />
+  <div id="clock"></div>
+</header>

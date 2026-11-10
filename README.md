@@ -183,7 +183,9 @@ src/
   router/    chọn key (quota.service), proxy + failover (gemini-proxy.controller)
   backup/    export / import
   db/        SQLite schema
-public/      UI (một file HTML)
+  ui/        trang dashboard: UiController render view, cấu hình view engine
+views/       template Handlebars: layout.hbs, index.hbs, partials/ (header + mỗi tab một file)
+public/      file tĩnh: css/app.css, js/ (mỗi tab một file, core.js dùng chung, app.js khởi động)
 ```
 
 ## Lưu ý

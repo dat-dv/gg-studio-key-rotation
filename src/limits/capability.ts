@@ -50,6 +50,15 @@ export const CAPABILITY_LABEL: Record<Capability, string> = {
   other: 'sinh media khác',
 };
 
+/** Nhãn và gợi ý endpoint hiện trên dashboard (tab Limits, form và hàng chi tiết client key). */
+export const CAPABILITY_UI: Record<Capability, { label: string; how: string }> = {
+  chat: { label: 'Chat / text', how: '/v1/chat/completions hoặc :generateContent' },
+  embedding: { label: 'Embedding', how: '/v1/embeddings hoặc :embedContent' },
+  tts: { label: 'TTS (giọng nói)', how: 'chỉ :generateContent, responseModalities ["AUDIO"]' },
+  image: { label: 'Sinh ảnh', how: 'chỉ :generateContent, responseModalities ["IMAGE"]' },
+  other: { label: 'Media khác', how: 'chỉ :generateContent' },
+};
+
 /** null = model gọi được qua endpoint này; ngược lại là thông báo lỗi kèm cách gọi đúng. */
 export function capabilityMismatch(cap: Capability, op: Operation, model: string): string | null {
   if (ALLOWED[op].includes(cap)) return null;

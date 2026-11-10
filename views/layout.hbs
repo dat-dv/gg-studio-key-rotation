@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{{title}}</title>
+<link rel="stylesheet" href="/css/app.css?v={{assetVersion}}" />
+</head>
+<body>
+{{> header}}
+
+<main>
+{{{body}}}
+</main>
+<div id="toast"></div>
+
+{{!-- Dữ liệu server đưa sẵn cho script (không chứa gì cần đăng nhập); đọc ở js/core.js --}}
+<script id="boot" type="application/json">{{{boot}}}</script>
+{{#each scripts}}
+<script src="/js/{{this}}.js?v={{../assetVersion}}"></script>
+{{/each}}
+</body>
+</html>

@@ -1,10 +1,10 @@
 import 'reflect-metadata';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { json } from 'express';
+import { setupViews } from './ui/view-engine';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 
@@ -12,7 +12,7 @@ async function bootstrap() {
   const { AppModule } = await import('./app.module'); // import sau khi load .env
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
   app.use(json({ limit: '50mb' })); // request có ảnh/audio base64
-  app.useStaticAssets(join(__dirname, '..', 'public'));
+  setupViews(app);
   app.enableShutdownHooks();
 
   const port = Number(process.env.PORT) || 3000;
