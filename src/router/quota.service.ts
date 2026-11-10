@@ -54,7 +54,7 @@ interface LogRow {
 
 export type ReserveResult =
   | { ok: true; key: ApiKeyRow; logId: number }
-  | { ok: false; reason: 'no_keys' | 'exhausted'; retryAt: number | null; detail: string[] };
+  | { ok: false; reason: 'no_keys' | 'exhausted' | 'client_limit'; retryAt: number | null; detail: string[] };
 
 /**
  * Toàn bộ việc CHỌN KEY chạy trong RAM, không có lệnh DB nào trên đường đi của request:
@@ -70,6 +70,8 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   private readonly counters = new Map<string, Counter>();
   /** cooldowns[keyId][modelId] */
   private readonly cooldowns = new Map<number, Map<string, { until: number; reason: string }>>();
+  /** số request tính quota hôm nay của từng client key (để chặn theo hạn mức riêng) */
+  private readonly clientDay = new Map<number, { day: number; n: number }>();
   /** request đang chờ kết quả: logId -> bộ đếm đã giữ chỗ + dòng log */
   private readonly inflight = new Map<number, { c: Counter; row: LogRow }>();
   private dayCache = { start: 0, end: 0 };
@@ -136,6 +138,12 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     this.counters.clear();
     this.cooldowns.clear();
     this.inflight.clear();
+    this.clientDay.clear();
+
+    const perClient = this.db
+      .prepare(`SELECT client_id AS id, COUNT(*) AS n FROM request_log WHERE ts >= ? AND client_id IS NOT NULL AND status IN ${COUNTED} GROUP BY client_id`)
+      .all(day) as { id: number; n: number }[];
+    for (const r of perClient) this.clientDay.set(r.id, { day, n: r.n });
 
     const daily = this.db
       .prepare(`SELECT key_id, model_id, COUNT(*) AS rpd FROM request_log WHERE ts >= ? AND status IN ${COUNTED} GROUP BY key_id, model_id`)
@@ -220,6 +228,18 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     return { rpm: c.win.length, tpm, rpd: c.rpd, oldestInMinute: c.win.length ? c.win[0].ts : null };
   }
 
+  private clientCounter(clientId: number, now: number) {
+    const day = this.day(now).start;
+    let c = this.clientDay.get(clientId);
+    if (!c || c.day !== day) this.clientDay.set(clientId, (c = { day, n: 0 }));
+    return c;
+  }
+
+  /** Số request tính quota hôm nay của một client key (gồm cả request đang chạy). */
+  clientUsed(clientId: number, now = Date.now()) {
+    return this.clientCounter(clientId, now).n;
+  }
+
   // ---------------------------------------------------------------- cooldown
 
   private cooldownMap(keyId: number) {
@@ -275,8 +295,16 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     estTokens: number,
     exclude: Set<number>,
     clientId: number | null = null,
+    /** hạn mức request/ngày của client key; null = không giới hạn riêng */
+    clientLimit: number | null = null,
   ): ReserveResult {
     const now = Date.now();
+    // kiểm tra trong cùng khối đồng bộ với việc giữ chỗ -> 2 request đồng thời không cùng lấy slot cuối
+    if (clientId != null && clientLimit != null) {
+      const used = this.clientCounter(clientId, now).n;
+      if (used >= clientLimit)
+        return { ok: false, reason: 'client_limit', retryAt: this.day(now).end, detail: [`hết hạn mức ${used}/${clientLimit} request hôm nay`] };
+    }
     const keys = this.keys.enabledKeys();
     if (!keys.length) return { ok: false, reason: 'no_keys', retryAt: null, detail: ['Chưa có key nào đang bật'] };
 
@@ -339,6 +367,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     const c = this.counter(best.key.id, limit.modelId, now);
     c.rpd++;
     c.win.push({ id: row.id, ts: now, tokens: estTokens });
+    if (clientId != null) this.clientCounter(clientId, now).n++;
     this.inflight.set(row.id, { c, row });
     this.insertQueue.push(row);
     if (this.insertQueue.length === FLUSH_MAX_QUEUE) setImmediate(() => this.flush());
@@ -370,6 +399,8 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
     } else {
       if (i >= 0) c.win.splice(i, 1);
       if (c.day === this.day(row.ts).start) c.rpd = Math.max(0, c.rpd - 1);
+      const cc = row.clientId != null ? this.clientDay.get(row.clientId) : undefined;
+      if (cc && cc.day === this.day(row.ts).start) cc.n = Math.max(0, cc.n - 1);
     }
   }
 

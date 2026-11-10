@@ -1,6 +1,7 @@
 <div class="card">
   <h2 id="clientFormTitle">Tạo key cho nơi khác gọi vào gateway</h2>
   <div class="field" style="max-width:420px"><label>Tên (service / người dùng)</label><input id="clientName" placeholder="vd: chatbot-cskh" /></div>
+  <div class="field" style="max-width:420px"><label>Hạn mức request / ngày <span class="hint">— để trống = không giới hạn riêng, chỉ theo pool key Google</span></label><input id="clientLimit" type="number" min="1" step="1" placeholder="vd: 100" /></div>
   <label>Mục đích <span class="hint">— bấm để tự tick các model thuộc loại đó, sau đó vẫn sửa tay được</span></label>
   <div id="clientPurposes" class="row" style="margin:4px 0 12px"></div>
   <label>Model được phép dùng <span class="hint">— không chọn gì = được dùng mọi model</span></label>
@@ -16,7 +17,7 @@
 <div class="card">
   <h2>Client keys <span class="hint" id="clientAuthHint"></span></h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Tên</th><th>Key</th><th>Model được phép</th><th>Hôm nay</th><th>Dùng lần cuối</th><th></th></tr></thead>
+    <thead><tr><th>Tên</th><th>Key</th><th>Model được phép</th><th>Hôm nay</th><th title="Số request key này còn gọi được hôm nay: phần còn lại của hạn mức riêng (nếu có đặt), nhưng không vượt quá RPD còn lại của pool key Google cho các model key này được dùng.">Còn gọi được</th><th>Dùng lần cuối</th><th></th></tr></thead>
     <tbody id="clientsBody"></tbody>
   </table></div>
 </div>

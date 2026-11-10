@@ -1,14 +1,20 @@
 import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, UseGuards } from '@nestjs/common';
 import { AdminGuard } from '../common/token.guard';
+import { QuotaService } from '../router/quota.service';
 import { ClientsService } from './clients.service';
 
 @UseGuards(AdminGuard)
 @Controller('api/clients')
 export class ClientsController {
-  constructor(private readonly clients: ClientsService) {}
+  constructor(
+    private readonly clients: ClientsService,
+    private readonly quota: QuotaService,
+  ) {}
 
   @Get()
   list() {
+    // số đã dùng hôm nay đọc từ request_log: ghi nốt log còn trong hàng đợi để khớp với bộ đếm hạn mức trong RAM
+    this.quota.flush();
     return this.clients.list();
   }
 

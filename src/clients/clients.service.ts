@@ -10,6 +10,8 @@ export interface ClientContext {
   name: string;
   /** null = được dùng mọi model */
   allowedModels: string[] | null;
+  /** số request/ngày key này được gọi; null = không giới hạn riêng */
+  dailyLimit: number | null;
 }
 
 interface Row {
@@ -23,6 +25,7 @@ interface Row {
   enabled: number;
   created_at: number;
   last_used_at: number | null;
+  daily_limit: number | null;
 }
 
 export const hashToken = (t: string) => createHash('sha256').update(t).digest('hex');
@@ -64,6 +67,16 @@ export class ClientsService {
     return [...out];
   }
 
+  /** undefined = không đổi (trả `cur`); null / '' = bỏ hạn mức; còn lại phải là số nguyên >= 1. */
+  private normalizeLimit(input: unknown, cur: number | null): number | null {
+    if (input === undefined) return cur;
+    if (input === null || input === '') return null;
+    const n = Number(input);
+    if (!Number.isInteger(n) || n < 1)
+      throw new BadRequestException('dailyLimit phải là số nguyên >= 1, hoặc để trống = không giới hạn (muốn chặn hẳn thì tắt key)');
+    return n;
+  }
+
   /** token_hash -> row, cache trong RAM để xác thực request không phải gọi DB */
   private cache: Map<string, Row> | null = null;
 
@@ -92,6 +105,19 @@ export class ClientsService {
       )
       .all(quotaDayStart()) as { id: number; n: number; tokens: number }[];
     const byId = new Map(today.map((t) => [t.id, t]));
+    // số request hôm nay của từng client theo model, để UI đặt cạnh quota còn lại của pool
+    const perModel = this.db
+      .prepare(
+        `SELECT client_id AS id, model_id AS modelId, COUNT(*) AS n FROM request_log
+         WHERE ts >= ? AND client_id IS NOT NULL AND status IN ('pending','ok','error') GROUP BY client_id, model_id`,
+      )
+      .all(quotaDayStart()) as { id: number; modelId: string; n: number }[];
+    const usedByModel = new Map<number, Record<string, number>>();
+    for (const r of perModel) {
+      let m = usedByModel.get(r.id);
+      if (!m) usedByModel.set(r.id, (m = {}));
+      m[r.modelId] = r.n;
+    }
     return (this.db.prepare('SELECT * FROM client_keys ORDER BY name COLLATE NOCASE, id').all() as Row[]).map((r) => ({
       id: r.id,
       name: r.name,
@@ -101,21 +127,24 @@ export class ClientsService {
       enabled: !!r.enabled,
       createdAt: r.created_at,
       lastUsedAt: r.last_used_at,
+      dailyLimit: r.daily_limit ?? null,
       requestsToday: byId.get(r.id)?.n ?? 0,
       tokensToday: byId.get(r.id)?.tokens ?? 0,
+      usedByModel: usedByModel.get(r.id) ?? {},
     }));
   }
 
-  create(dto: { name?: string; allowedModels?: unknown }) {
+  create(dto: { name?: string; allowedModels?: unknown; dailyLimit?: unknown }) {
     const name = (dto.name || '').trim();
     if (!name) throw new BadRequestException('Tên là bắt buộc');
     const models = this.normalizeModels(dto.allowedModels);
+    const dailyLimit = this.normalizeLimit(dto.dailyLimit, null);
     const token = `sk-gg-${randomBytes(24).toString('base64url')}`;
     const info = this.db
-      .prepare('INSERT INTO client_keys (name, token_hash, token_prefix, token, allowed_models, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(name, hashToken(token), token.slice(0, 11), token, JSON.stringify(models), Date.now());
+      .prepare('INSERT INTO client_keys (name, token_hash, token_prefix, token, allowed_models, daily_limit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(name, hashToken(token), token.slice(0, 11), token, JSON.stringify(models), dailyLimit, Date.now());
     this.invalidate();
-    return { id: Number(info.lastInsertRowid), name, token, allowedModels: models };
+    return { id: Number(info.lastInsertRowid), name, token, allowedModels: models, dailyLimit };
   }
 
   /** Key đầy đủ để admin xem lại. */
@@ -127,14 +156,17 @@ export class ClientsService {
     return { token: row.token };
   }
 
-  update(id: number, dto: { name?: string; allowedModels?: unknown; enabled?: boolean }) {
+  update(id: number, dto: { name?: string; allowedModels?: unknown; enabled?: boolean; dailyLimit?: unknown }) {
     const cur = this.db.prepare('SELECT * FROM client_keys WHERE id=?').get(id) as Row | undefined;
     if (!cur) throw new NotFoundException(`Client key #${id} not found`);
     const name = dto.name !== undefined ? dto.name.trim() : cur.name;
     if (!name) throw new BadRequestException('Tên không được rỗng');
     const models = dto.allowedModels !== undefined ? this.normalizeModels(dto.allowedModels) : this.parseModels(cur);
     const enabled = dto.enabled !== undefined ? (dto.enabled ? 1 : 0) : cur.enabled;
-    this.db.prepare('UPDATE client_keys SET name=?, allowed_models=?, enabled=? WHERE id=?').run(name, JSON.stringify(models), enabled, id);
+    const dailyLimit = this.normalizeLimit(dto.dailyLimit, cur.daily_limit ?? null);
+    this.db
+      .prepare('UPDATE client_keys SET name=?, allowed_models=?, enabled=?, daily_limit=? WHERE id=?')
+      .run(name, JSON.stringify(models), enabled, dailyLimit, id);
     this.invalidate();
     return this.list().find((c) => c.id === id);
   }
@@ -155,6 +187,6 @@ export class ClientsService {
       this.db.prepare('UPDATE client_keys SET last_used_at=? WHERE id=?').run(now, row.id);
     }
     const models = this.parseModels(row);
-    return { id: row.id, name: row.name, allowedModels: models.length ? models : null };
+    return { id: row.id, name: row.name, allowedModels: models.length ? models : null, dailyLimit: row.daily_limit ?? null };
   }
 }

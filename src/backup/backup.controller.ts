@@ -16,7 +16,7 @@ interface BackupFile {
   limits: { modelId: string; displayName: string; category: string; rpm: number | null; tpm: number | null; rpd: number | null; aliases: string[]; capabilityOverride?: string | null; sortOrder: number }[];
   /** usage & cooldown tham chiếu key bằng chính apiKey vì id ở 2 máy khác nhau */
   /** key cấp cho client; `token` (key đầy đủ) vắng mặt với key cũ chỉ có hash */
-  clients?: { name: string; tokenHash: string; tokenPrefix: string; token?: string | null; allowedModels: string[]; enabled: boolean; createdAt: number; lastUsedAt: number | null }[];
+  clients?: { name: string; tokenHash: string; tokenPrefix: string; token?: string | null; allowedModels: string[]; enabled: boolean; createdAt: number; lastUsedAt: number | null; dailyLimit?: number | null }[];
   logs?: { clientHash?: string | null; apiKey: string; modelId: string; requestedModel: string; ts: number; tokens: number; status: string; httpStatus: number | null; error: string | null; latencyMs: number | null }[];
   cooldowns?: { apiKey: string; modelId: string; until: number; reason: string }[];
 }
@@ -65,6 +65,7 @@ export class BackupController {
         enabled: !!c.enabled,
         createdAt: c.created_at,
         lastUsedAt: c.last_used_at,
+        dailyLimit: c.daily_limit ?? null,
       })),
     };
     if (withUsage) {
@@ -153,18 +154,20 @@ export class BackupController {
         const models = JSON.stringify(Array.isArray(c.allowedModels) ? c.allowedModels : []);
         // chỉ nhận key đầy đủ khi nó khớp đúng hash dùng để xác thực
         const token = typeof c.token === 'string' && hashToken(c.token) === c.tokenHash ? c.token : null;
+        // backup cũ không có trường này -> không giới hạn
+        const dailyLimit = Number.isInteger(c.dailyLimit) && (c.dailyLimit as number) >= 1 ? c.dailyLimit : null;
         const existing = findClient.get(c.tokenHash) as { id: number } | undefined;
         if (existing) {
           this.db
-            .prepare('UPDATE client_keys SET name=?, allowed_models=?, enabled=?, token=COALESCE(token, ?) WHERE id=?')
-            .run(c.name, models, c.enabled ? 1 : 0, token, existing.id);
+            .prepare('UPDATE client_keys SET name=?, allowed_models=?, enabled=?, daily_limit=?, token=COALESCE(token, ?) WHERE id=?')
+            .run(c.name, models, c.enabled ? 1 : 0, dailyLimit, token, existing.id);
           clientIdByHash.set(c.tokenHash, existing.id);
         } else {
           const info = this.db
             .prepare(
-              'INSERT INTO client_keys (name, token_hash, token_prefix, token, allowed_models, enabled, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              'INSERT INTO client_keys (name, token_hash, token_prefix, token, allowed_models, enabled, created_at, last_used_at, daily_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             )
-            .run(c.name, c.tokenHash, c.tokenPrefix || 'sk-gg-', token, models, c.enabled ? 1 : 0, c.createdAt || Date.now(), c.lastUsedAt ?? null);
+            .run(c.name, c.tokenHash, c.tokenPrefix || 'sk-gg-', token, models, c.enabled ? 1 : 0, c.createdAt || Date.now(), c.lastUsedAt ?? null, dailyLimit);
           clientIdByHash.set(c.tokenHash, Number(info.lastInsertRowid));
         }
         result.clients++;

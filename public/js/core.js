@@ -54,6 +54,14 @@ function keyAvailable(k, l) {
   return !(l.rpm != null && u.rpm >= l.rpm) && !(l.rpd != null && u.rpd >= l.rpd) && !(l.tpm != null && u.tpm >= l.tpm);
 }
 
+/** Thanh "đã dùng / giới hạn" (trang Quota và hàng chi tiết ở trang Client keys). */
+function meter(used, limit) {
+  if (limit === 0) return '<span class="muted">0 / 0</span>';
+  const pct = limit == null ? 0 : Math.min(100, (used / limit) * 100);
+  const cls = pct >= 100 ? 'full' : pct >= 75 ? 'hi' : '';
+  return `<div class="meter ${cls}"><span class="num">${fmt(used)} / ${fmt(limit)}</span><div class="bar"><i style="width:${pct}%"></i></div></div>`;
+}
+
 function render() {
   renderClock();
   page.onState.forEach((f) => f());
