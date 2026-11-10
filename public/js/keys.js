@@ -85,6 +85,16 @@ $('#keysJsonFile').onchange = async (ev) => {
   updatePreview();
 };
 
+/** Script chạy trong Console của AI Studio để tạo hàng loạt project + key, xuất ra JSON nạp được ở trên. */
+$('#copyCreateScript').onclick = async () => {
+  try {
+    const res = await fetch('/tools/aistudio-create-project-key.js', { cache: 'no-cache' });
+    if (!res.ok) throw new Error('Không tải được script (' + res.status + ')');
+    await navigator.clipboard.writeText(await res.text());
+    toast('Đã copy script. Dán vào Console ở aistudio.google.com/projects');
+  } catch (e) { toast(e.message); }
+};
+
 function resetAddForm() {
   $('#curl').value = ''; $('#project').value = ''; $('#note').value = '';
   setBulk(null);

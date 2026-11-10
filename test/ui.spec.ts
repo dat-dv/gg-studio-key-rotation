@@ -114,3 +114,10 @@ test('import JSON nhiều key: lưu dòng hợp lệ, bỏ qua dòng trùng/thi�
 
   assert.equal((await post('/api/keys/import', { json: 'not json' })).status, 400);
 });
+
+test('trang Keys có nút copy script tạo key và script tải được', async () => {
+  assert.ok((await (await fetch(base + '/keys')).text()).includes('id="copyCreateScript"'));
+  const res = await fetch(base + '/tools/aistudio-create-project-key.js');
+  assert.equal(res.status, 200);
+  assert.ok((await res.text()).includes('JSON.stringify(result'));
+});
