@@ -12,6 +12,9 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
       PROXY_TOKEN: ${PROXY_TOKEN:?set PROXY_TOKEN in .env}
       MAX_ATTEMPTS: ${MAX_ATTEMPTS:-4}
+      # Địa chỉ hiện trong lệnh curl mẫu ở màn hình Client keys (không ảnh hưởng tới việc chạy)
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      LOCAL_BASE_URL: ${LOCAL_BASE_URL:-http://gg-studio:3000}
     volumes:
       - gg-data:/app/data
 
