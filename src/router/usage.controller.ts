@@ -19,6 +19,15 @@ export class UsageController {
     return { keys: this.keys.list(), limits: this.limits.list(), ...this.quota.snapshot() };
   }
 
+  /** Địa chỉ gợi ý cho lệnh curl mẫu ở màn hình Client keys. */
+  @Get('config')
+  config() {
+    return {
+      publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '') || null,
+      localBaseUrl: (process.env.LOCAL_BASE_URL || '').replace(/\/+$/, '') || null,
+    };
+  }
+
   @Get('logs')
   logs(@Query('limit') limit?: string) {
     return this.quota.logs(Number(limit) || 200);

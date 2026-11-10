@@ -489,6 +489,7 @@ async function loadClients() {
     <td class="hint">${c.lastUsedAt ? new Date(c.lastUsedAt).toLocaleString() : 'chưa dùng'}</td>
     <td class="row" style="justify-content:flex-end">
       ${c.enabled ? '' : '<span class="badge bad">Tắt</span>'}
+      <button class="btn sm" onclick="snippetFor(${c.id})">Curl</button>
       <button class="btn sm" onclick="editClient(${c.id})">Sửa</button>
       <button class="btn sm" onclick="toggleClient(${c.id}, ${!c.enabled})">${c.enabled ? 'Tắt' : 'Bật'}</button>
       <button class="btn sm danger" onclick="delClient(${c.id})">Xoá</button>
@@ -522,24 +523,78 @@ $('#clientSave').onclick = async () => {
       toast('Đã lưu');
     } else {
       const r = await api('/api/clients', { method: 'POST', body });
-      const base = location.origin;
-      const model = r.allowedModels[0] || 'gemini-2.5-flash';
-      const box = $('#clientToken');
-      box.hidden = false;
-      box.innerHTML = `<b class="ok">Đã tạo key cho "${esc(r.name)}"</b> — key chỉ hiện <b>một lần</b>, hãy copy ngay.
-        <div class="row" style="margin-top:8px"><code id="newToken" style="font-size:13px;padding:4px 8px">${esc(r.token)}</code><button class="btn sm" id="copyToken">Copy</button></div>
-        <pre>Base URL (OpenAI SDK): ${esc(base)}/v1
-
-curl ${esc(base)}/v1/chat/completions \\
-  -H "Authorization: Bearer ${esc(r.token)}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"${esc(model)}","messages":[{"role":"user","content":"Xin chào"}]}'</pre>`;
-      $('#copyToken').onclick = async () => { await navigator.clipboard.writeText(r.token); toast('Đã copy key'); };
+      showSnippet({ name: r.name, token: r.token, model: r.allowedModels[0] });
     }
     resetClientForm();
     loadClients();
   } catch (e) { toast(e.message); }
 };
+// ----- lệnh curl mẫu: chọn gọi qua Domain (public) hay Local (nội bộ) -----
+let gwConfig = { publicBaseUrl: null, localBaseUrl: null };
+api('/api/config').then((c) => { gwConfig = c; }).catch(() => {});
+let snippet = null; // { name, token | null, model }
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+function baseFor(mode) {
+  const saved = lsGet('snippetBase:' + mode);
+  if (saved) return saved;
+  return mode === 'domain' ? (gwConfig.publicBaseUrl || location.origin) : (gwConfig.localBaseUrl || 'http://gg-studio:3000');
+}
+function snippetText() {
+  const base = $('#snipBase').value.trim().replace(/\/+$/, '');
+  const key = snippet.token || '<CLIENT_KEY>';
+  const model = snippet.model || 'gemini-2.5-flash';
+  if ($('#snipFmt').value === 'gemini')
+    return `curl "${base}/v1beta/models/${model}:generateContent" \\
+  -H "x-goog-api-key: ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"contents":[{"parts":[{"text":"Xin chào"}]}]}'`;
+  return `curl ${base}/v1/chat/completions \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","messages":[{"role":"user","content":"Xin chào"}]}'`;
+}
+function updateSnippet() {
+  const base = $('#snipBase').value.trim().replace(/\/+$/, '');
+  $('#snipSdk').textContent = `${base}/v1`;
+  $('#snipCurl').textContent = snippetText();
+}
+function showSnippet(sn) {
+  snippet = sn;
+  const mode = lsGet('snippetMode') || 'domain';
+  const box = $('#clientToken');
+  box.hidden = false;
+  box.innerHTML = `
+    ${sn.token
+      ? `<b class="ok">Đã tạo key cho "${esc(sn.name)}"</b> — key chỉ hiện <b>một lần</b>, hãy copy ngay.
+         <div class="row" style="margin-top:8px"><code style="font-size:13px;padding:4px 8px">${esc(sn.token)}</code><button class="btn sm" id="copyToken">Copy key</button></div>`
+      : `<b>Lệnh mẫu cho key "${esc(sn.name)}"</b> <span class="hint">— key đầy đủ không lưu lại, thay <code>&lt;CLIENT_KEY&gt;</code> bằng key đã cấp.</span>`}
+    <div class="row" style="margin-top:12px">
+      <label class="row" style="margin:0;color:var(--text);cursor:pointer"><input type="radio" name="snipMode" value="domain" style="width:auto" ${mode === 'domain' ? 'checked' : ''} /> Domain (từ ngoài vào)</label>
+      <label class="row" style="margin:0;color:var(--text);cursor:pointer"><input type="radio" name="snipMode" value="local" style="width:auto" ${mode === 'local' ? 'checked' : ''} /> Local (nội bộ)</label>
+      <select id="snipFmt" style="width:auto"><option value="openai">Chuẩn OpenAI</option><option value="gemini">Chuẩn Gemini</option></select>
+    </div>
+    <div class="row" style="margin-top:8px"><input id="snipBase" style="max-width:420px" spellcheck="false" /><span class="hint" id="snipHint"></span></div>
+    <div class="hint" style="margin-top:8px">Base URL cho OpenAI SDK: <code id="snipSdk"></code></div>
+    <pre id="snipCurl"></pre>
+    <div class="row" style="margin-top:8px"><button class="btn sm" id="copyCurl">Copy curl</button><button class="btn sm" id="closeSnippet">Đóng</button></div>`;
+  const setMode = (m) => {
+    lsSet('snippetMode', m);
+    $('#snipBase').value = baseFor(m);
+    $('#snipHint').textContent = m === 'domain' ? 'địa chỉ public của gateway' : 'địa chỉ trong docker network / cùng máy, sửa cho đúng môi trường của anh';
+    updateSnippet();
+  };
+  box.querySelectorAll('input[name=snipMode]').forEach((r) => (r.onchange = () => setMode(r.value)));
+  $('#snipBase').oninput = () => { lsSet('snippetBase:' + (box.querySelector('input[name=snipMode]:checked').value), $('#snipBase').value.trim()); updateSnippet(); };
+  $('#snipFmt').onchange = updateSnippet;
+  $('#copyCurl').onclick = async () => { await navigator.clipboard.writeText($('#snipCurl').textContent); toast('Đã copy curl'); };
+  $('#closeSnippet').onclick = () => { box.hidden = true; };
+  if (sn.token) $('#copyToken').onclick = async () => { await navigator.clipboard.writeText(sn.token); toast('Đã copy key'); };
+  setMode(mode);
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function snippetFor(id) { const c = clients.find((x) => x.id === id); showSnippet({ name: c.name, token: null, model: c.allowedModels[0] }); }
+
 async function toggleClient(id, enabled) { try { await api(`/api/clients/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); loadClients(); } catch (e) { toast(e.message); } }
 async function delClient(id) { const c = clients.find((x) => x.id === id); if (!confirm(`Xoá key "${c.name}"? Nơi đang dùng key này sẽ bị từ chối ngay.`)) return; await api(`/api/clients/${id}`, { method: 'DELETE' }); loadClients(); }
 
