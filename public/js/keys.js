@@ -87,26 +87,83 @@ $('#keysJsonFile').onchange = async (ev) => {
 
 /**
  * Script chạy trong Console của AI Studio để tạo hàng loạt project + key, xuất ra JSON nạp được ở trên.
- * Hỏi prefix trước, điền sẵn vào script rồi mới copy, nên dán vào Console là chạy luôn.
+ * Hỏi prefix, số project và URL trang Projects trước, điền sẵn vào script rồi mới copy.
  */
-const PREFIX_SLOT = "const PREFIX = '';";
-$('#copyCreateScript').onclick = async () => {
-  let last = '';
-  try { last = localStorage.getItem('createKeyPrefix') || ''; } catch {}
-  const answer = prompt('Name prefix cho project (vd: datvan193). Script sẽ tạo <prefix>-1 … <prefix>-10:', $('#account').value.trim() || last);
-  if (answer == null) return;
-  const prefix = answer.trim();
-  if (!prefix) return toast('Chưa nhập prefix, chưa copy.');
+const SCRIPT_SLOTS = { prefix: "const PREFIX = '';", count: 'const COUNT = 10;', target: "const TARGET = '';" };
+const SCRIPT_URL_DEFAULT = 'https://aistudio.google.com/projects';
+const lsRead = (k) => { try { return localStorage.getItem(k) || ''; } catch { return ''; } };
+const lsWrite = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+
+/** Đọc form; trả null (kèm toast) nếu có ô nhập sai. */
+function scriptOptions() {
+  const prefix = $('#scriptPrefix').value.trim();
+  if (!prefix) { toast('Chưa nhập prefix.'); return null; }
+  const count = Number($('#scriptCount').value);
+  if (!Number.isInteger(count) || count < 1 || count > 50) { toast('Số project phải từ 1 đến 50.'); return null; }
+  let url;
+  try { url = new URL($('#scriptUrl').value.trim() || SCRIPT_URL_DEFAULT); } catch { toast('URL không hợp lệ.'); return null; }
+  if (url.protocol !== 'https:' || url.host !== 'aistudio.google.com') { toast('URL phải là trang của https://aistudio.google.com'); return null; }
+  lsWrite('createKeyPrefix', prefix); lsWrite('createKeyCount', String(count)); lsWrite('createKeyUrl', url.href);
+  return { prefix, count, target: url.href };
+}
+
+$('#copyCreateScript').onclick = () => {
+  $('#scriptPrefix').value = $('#account').value.trim() || lsRead('createKeyPrefix');
+  $('#scriptCount').value = lsRead('createKeyCount') || '10';
+  $('#scriptUrl').value = lsRead('createKeyUrl') || SCRIPT_URL_DEFAULT;
+  $('#scriptDialog').showModal();
+};
+$('#scriptCancel').onclick = () => $('#scriptDialog').close();
+$('#scriptOpen').onclick = () => { const o = scriptOptions(); if (o) window.open(o.target, '_blank', 'noopener'); };
+$('#scriptCopy').onclick = async () => {
+  const o = scriptOptions();
+  if (!o) return;
   try {
-    const res = await fetch('/tools/aistudio-create-project-key.js', { cache: 'no-cache' });
+    const res = await fetch('/tools/aistudio-create-project-key.user.js', { cache: 'no-cache' });
     if (!res.ok) throw new Error('Không tải được script (' + res.status + ')');
-    const src = await res.text();
-    if (!src.includes(PREFIX_SLOT)) throw new Error('Script thiếu chỗ điền prefix');
-    await navigator.clipboard.writeText(src.replace(PREFIX_SLOT, () => `const PREFIX = ${JSON.stringify(prefix)};`));
-    try { localStorage.setItem('createKeyPrefix', prefix); } catch {}
-    toast(`Đã copy script với prefix "${prefix}". Dán vào Console ở aistudio.google.com/projects`);
+    let src = await res.text();
+    const fill = { prefix: `const PREFIX = ${JSON.stringify(o.prefix)};`, count: `const COUNT = ${o.count};`, target: `const TARGET = ${JSON.stringify(o.target)};` };
+    for (const [k, slot] of Object.entries(SCRIPT_SLOTS)) {
+      if (!src.includes(slot)) throw new Error('Script thiếu chỗ điền ' + k);
+      src = src.replace(slot, () => fill[k]);
+    }
+    await navigator.clipboard.writeText(src);
+    toast(`Đã copy script: ${o.count} project, prefix "${o.prefix}". Dán vào Console của trang Projects.`);
   } catch (e) { toast(e.message); }
 };
+
+/**
+ * Tự động: mở trang Projects kèm #gg-auto=<json>; userscript đã cài trong trình duyệt chạy ở tab đó, xong thì
+ * chuyển tab đó về /keys#gg-result=<json>. Chỉ nhận kết quả mang đúng mã của lần bấm gần nhất (lưu trong
+ * localStorage), nếu không thì trang web nào cũng nhét được key lạ vào pool bằng một đường link.
+ */
+$('#scriptAuto').onclick = () => {
+  const o = scriptOptions();
+  if (!o) return;
+  const nonce = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now();
+  const url = new URL(o.target);
+  url.hash = 'gg-auto=' + encodeURIComponent(JSON.stringify({ prefix: o.prefix, count: o.count, origin: location.origin, nonce }));
+  lsWrite('createKeyNonce', nonce);
+  if (lsRead('createKeyNonce') !== nonce) return toast('Trình duyệt chặn localStorage nên không chạy tự động được.');
+  if (!window.open(url.href, '_blank')) return toast('Trình duyệt chặn mở tab mới. Cho phép popup rồi bấm lại.');
+  $('#scriptStatus').textContent = 'Đã mở tab AI Studio. Bấm OK ở hộp xác nhận bên đó; xong nó tự quay về trang Keys và import. Tab đó không tự chạy nghĩa là chưa cài userscript.';
+};
+
+/** Tab AI Studio vừa quay về kèm kết quả: xoá khỏi URL ngay rồi import. */
+async function takeAutoResult() {
+  const m = location.hash.match(/gg-result=([^&]+)/);
+  if (!m) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  let data;
+  try { data = JSON.parse(decodeURIComponent(m[1])); } catch { return toast('Kết quả từ AI Studio bị hỏng.'); }
+  const nonce = lsRead('createKeyNonce');
+  if (!nonce || data.nonce !== nonce) return toast('Bỏ qua kết quả không khớp với lần bấm Tự động gần nhất.');
+  try { localStorage.removeItem('createKeyNonce'); } catch {}
+  $('#curl').value = JSON.stringify(data.keys, null, 2);
+  await updatePreview();
+  if (bulkCount) await importKeysJson();
+  else toast('AI Studio không trả về key nào.');
+}
 
 function resetAddForm() {
   $('#curl').value = ''; $('#project').value = ''; $('#note').value = '';
@@ -164,3 +221,4 @@ async function editKey(id) {
 }
 
 page.onState.push(renderKeys);
+takeAutoResult();

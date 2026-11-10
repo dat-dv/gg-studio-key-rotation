@@ -10,7 +10,22 @@
       <button class="btn sm" id="copyCreateScript">Copy script tạo key</button>
       <span class="hint">JSON dạng <code>{ "1": { "name": "datvan193-1", "key": "AQ.…" }, … }</code></span>
     </div>
-    <div class="hint" style="margin-bottom:8px">Script tạo 10 project + key: mở <a href="https://aistudio.google.com/projects" target="_blank" rel="noopener" style="color:var(--accent)">aistudio.google.com/projects</a>, F12 → Console, dán script (prefix đã nhập lúc bấm copy), rồi dán JSON kết quả vào ô trên.</div>
+    <div class="hint" style="margin-bottom:8px">Script tạo project + key: bấm nút trên, nhập prefix, số project và URL trang Projects của đúng tài khoản Google, rồi dán script vào Console (F12) của trang đó. Xong script tự tải file JSON về và hiện JSON để dán vào ô trên. Có cài userscript thì bấm <b>Tự động</b> là xong, không phải dán gì.</div>
+    <dialog id="scriptDialog" class="card">
+      <h2>Script tạo project + key trên AI Studio</h2>
+      <div class="field"><label>Name prefix</label><input id="scriptPrefix" placeholder="datvan193" /></div>
+      <div class="field"><label>Số project cần tạo</label><input id="scriptCount" type="number" min="1" max="50" value="10" /></div>
+      <div class="field"><label>URL trang Projects (đúng tài khoản Google)</label><input id="scriptUrl" placeholder="https://aistudio.google.com/u/1/projects" /></div>
+      <div class="hint" style="margin-bottom:12px">Đăng nhập nhiều tài khoản thì URL có số tài khoản, vd. <code>/u/1/projects</code>. Script chỉ chạy ở tab đúng tài khoản này.</div>
+      <div class="row">
+        <button class="btn primary" id="scriptAuto">Tự động</button>
+        <button class="btn" id="scriptCopy">Copy script</button>
+        <button class="btn" id="scriptOpen">Mở trang Projects</button>
+        <button class="btn" id="scriptCancel">Đóng</button>
+      </div>
+      <div class="hint" id="scriptStatus" style="margin-top:10px"></div>
+      <div class="hint" style="margin-top:10px"><b>Tự động</b> mở trang Projects ở tab mới, tạo project + key, tải file JSON về, rồi tab đó tự quay về trang này và import. Cần cài một lần: extension Tampermonkey, rồi <a href="/tools/aistudio-create-project-key.user.js" target="_blank" style="color:var(--accent)">cài userscript này</a>.</div>
+    </dialog>
     <div id="parsePreview" class="hint">Paste curl để xem key được trích ra.</div>
   </div>
   <div class="card">

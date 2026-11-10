@@ -1,12 +1,77 @@
+// ==UserScript==
+// @name         GG Studio: tạo project + API key trên AI Studio
+// @namespace    gg-studio
+// @version      1.0.0
+// @description  Chạy khi trang Keys của GG Studio mở AI Studio bằng nút "Tự động": tạo project + key, tải JSON về rồi chuyển tab về GG Studio để import.
+// @match        https://aistudio.google.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+//
 // AI Studio: tạo hàng loạt project + API key trước, sau đó mới đi lấy key của mọi project mang prefix,
 // xuất JSON { "1": { name, key }, ... }. Được bao nhiêu key thì xuất bấy nhiêu.
-// Cách dùng: mở https://aistudio.google.com/projects, F12 -> Console, dán cả đoạn này.
+// Hai cách dùng cùng một file này:
+//   1. Dán tay: mở trang Projects của AI Studio, F12 -> Console, dán cả đoạn này.
+//   2. Tự động: cài file này vào Tampermonkey một lần, rồi bấm "Tự động" ở trang Keys của GG Studio.
 (async () => {
   const COUNT = 10; // số project cần tạo
   const START = 1; // số thứ tự bắt đầu (prefix-1, prefix-2, ...)
   const PREFIX = ''; // trang Keys điền sẵn khi bấm copy; để trống thì script hỏi lúc chạy
+  const TARGET = ''; // URL trang Projects của đúng tài khoản (vd. https://aistudio.google.com/u/1/projects)
 
-  const prefix = (PREFIX || prompt('Nhập name prefix cho project (vd: datvan193):', '') || '').trim();
+  // Đăng nhập nhiều tài khoản thì mỗi tài khoản một số /u/<n>/; chạy nhầm tab sẽ tạo project cho nhầm người.
+  const userIndex = (path) => (path.match(/\/u\/(\d+)(\/|$)/) || [0, '0'])[1];
+  if (TARGET && typeof GM_info === 'undefined') {
+    const want = new URL(TARGET);
+    if (location.host !== want.host || userIndex(location.pathname) !== userIndex(want.pathname)) {
+      alert('Tab này không đúng tài khoản. Mở ' + TARGET + ' rồi dán lại script.');
+      return console.warn('Sai tab: cần ' + TARGET + ', đang ở ' + location.href);
+    }
+  }
+
+  // Chế độ tự động (chỉ khi chạy như userscript): trang Keys mở tab này kèm #gg-auto=<json>.
+  // Lưu vào sessionStorage để AI Studio có tự tải lại trang giữa chừng thì vẫn chạy tiếp.
+  const AUTO_KEY = 'ggStudioAuto';
+  const saveAuto = (a) => sessionStorage.setItem(AUTO_KEY, JSON.stringify(a));
+  const readAuto = () => {
+    const m = location.hash.match(/gg-auto=([^&]+)/);
+    if (m) {
+      history.replaceState(null, '', location.pathname + location.search);
+      try {
+        saveAuto({ ...JSON.parse(decodeURIComponent(m[1])), at: Date.now(), confirmed: false });
+      } catch {}
+    }
+    try {
+      const a = JSON.parse(sessionStorage.getItem(AUTO_KEY) || 'null');
+      const ok =
+        a &&
+        Date.now() - a.at < 15 * 60 * 1000 &&
+        typeof a.prefix === 'string' &&
+        a.prefix.trim() &&
+        Number.isInteger(a.count) &&
+        a.count >= 1 &&
+        a.count <= 50 &&
+        /^https?:\/\/[^/]+$/.test(a.origin || '');
+      return ok ? a : null;
+    } catch {
+      return null;
+    }
+  };
+  const asUserscript = typeof GM_info !== 'undefined';
+  const AUTO = asUserscript ? readAuto() : null;
+  if (asUserscript && !AUTO) return; // cài sẵn nhưng không được trang Keys gọi thì không làm gì
+  if (AUTO && !AUTO.confirmed) {
+    // Trang web nào cũng mở được URL có #gg-auto, nên phải hỏi và cho thấy kết quả sẽ gửi về đâu.
+    const yes = confirm(
+      `${AUTO.origin} muốn tạo ${AUTO.count} project "${AUTO.prefix.trim()}-<số>" kèm API key trên tài khoản Google này, ` +
+        'rồi nhận lại các key đó.\n\nChỉ bấm OK nếu đó là GG Studio của bạn.'
+    );
+    if (!yes) return sessionStorage.removeItem(AUTO_KEY);
+    saveAuto({ ...AUTO, confirmed: true });
+  }
+
+  const total = AUTO ? AUTO.count : COUNT;
+  const prefix = (AUTO ? AUTO.prefix : PREFIX || prompt('Nhập name prefix cho project (vd: datvan193):', '') || '').trim();
   if (!prefix) return console.warn('Chưa nhập prefix, dừng.');
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -211,8 +276,18 @@
       }
       copyBtn.textContent = 'Đã copy ✔';
     });
-    box.append(title, ta, copyBtn, mk('Đóng', () => box.remove()));
+    box.append(title, ta, copyBtn, mk('Tải file JSON', () => download(json)), mk('Đóng', () => box.remove()));
     document.body.append(box);
+  };
+  /** Lưu JSON thành file trong thư mục Downloads, phòng khi lỡ đóng tab trước khi copy. */
+  const download = (json) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    a.download = `gg-keys-${prefix}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   };
 
   const result = {};
@@ -220,10 +295,11 @@
   const failed = [];
   let createError = null;
   try {
+    if (AUTO) await waitFor(onProjects, 'trang Projects (đã đăng nhập đúng tài khoản chưa?)');
     // Giai đoạn 1: tạo hết project + key trước. Lỗi (vd. hết hạn mức project) thì dừng tạo, vẫn đi lấy key.
-    for (let i = 0; i < COUNT; i++) {
+    for (let i = 0; i < total; i++) {
       const name = `${prefix}-${START + i}`;
-      console.log(`⏳ Tạo [${i + 1}/${COUNT}] ${name}`);
+      console.log(`⏳ Tạo [${i + 1}/${total}] ${name}`);
       try {
         await createOne(name);
         created.push(name);
@@ -254,6 +330,9 @@
       await backToProjects().catch((err) => console.error('❌', err.message));
       await sleep(500);
     }
+  } catch (err) {
+    createError = createError || err;
+    console.error('❌', err.message);
   } finally {
     navigator.clipboard.writeText = origWrite;
     document.execCommand = origExec;
@@ -262,9 +341,21 @@
   const json = JSON.stringify(result, null, 2);
   const done = Object.keys(result).length;
   console.log(json);
+  if (done) download(json);
+  // Tự động: AI Studio cắt liên kết với tab đã mở nó (COOP) và chặn gọi mạng ra ngoài (CSP), nên trả kết quả
+  // bằng cách chuyển chính tab này về trang Keys, key nằm sau dấu # (không gửi lên server, trang Keys xoá ngay).
+  if (AUTO) sessionStorage.removeItem(AUTO_KEY);
+  if (AUTO && done) {
+    setTimeout(() => {
+      location.assign(
+        `${AUTO.origin}/keys#gg-result=${encodeURIComponent(JSON.stringify({ nonce: AUTO.nonce, keys: result }))}`
+      );
+    }, 2500); // chờ file JSON tải xong
+  }
   showResult(
     json,
-    `Lấy được ${done} key (tạo mới ${created.length}/${COUNT} project)` +
+    `Lấy được ${done} key (tạo mới ${created.length}/${total} project)${done ? ', đã tải file JSON về máy' : ''}` +
+      (AUTO && done ? ' · đang chuyển về GG Studio để import…' : '') +
       (createError ? ` · dừng tạo: ${createError.message}` : '') +
       (failed.length ? ` · không lấy được key: ${failed.join(', ')}` : '')
   );

@@ -117,11 +117,16 @@ test('import JSON nhiều key: lưu dòng hợp lệ, bỏ qua dòng trùng/thi�
 
 test('trang Keys có nút copy script tạo key và script tải được', async () => {
   assert.ok((await (await fetch(base + '/keys')).text()).includes('id="copyCreateScript"'));
-  const res = await fetch(base + '/tools/aistudio-create-project-key.js');
+  const res = await fetch(base + '/tools/aistudio-create-project-key.user.js');
   assert.equal(res.status, 200);
   const src = await res.text();
   assert.ok(src.includes('JSON.stringify(result'));
-  // chỗ trang Keys điền prefix trước khi copy: phải khớp PREFIX_SLOT trong public/js/keys.js
-  assert.ok(src.includes("const PREFIX = '';"));
-  assert.ok((await (await fetch(base + '/js/keys.js')).text()).includes(`const PREFIX_SLOT = "const PREFIX = '';";`));
+  assert.ok(src.startsWith('// ==UserScript=='));
+  assert.ok(src.includes('// @match        https://aistudio.google.com/*'));
+  // các chỗ trang Keys điền prefix / số project / URL trước khi copy: phải khớp SCRIPT_SLOTS trong public/js/keys.js
+  const keysJs = await (await fetch(base + '/js/keys.js')).text();
+  for (const slot of ["const PREFIX = '';", 'const COUNT = 10;', "const TARGET = '';"]) {
+    assert.equal(src.split(slot).length, 2, slot);
+    assert.ok(keysJs.includes(slot), slot);
+  }
 });

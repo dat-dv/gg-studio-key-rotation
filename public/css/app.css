@@ -76,3 +76,5 @@ tr.detail > td, tbody tr.detail:hover > td { background: var(--row-alt); padding
 .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px 24px; margin-bottom: 14px; }
 .kv > div > span:first-child { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
 .kv .wide { grid-column: 1 / -1; line-height: 1.9; }
+dialog.card { width: min(480px, 92vw); color: var(--text); margin: auto; }
+dialog.card::backdrop { background: rgba(0, 0, 0, .45); }
