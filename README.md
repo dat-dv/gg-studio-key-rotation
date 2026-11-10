@@ -6,7 +6,7 @@ Gateway nội bộ đứng trước Gemini API: gom nhiều API key free tier (m
 
 Free tier của Gemini API giới hạn theo **project** (ví dụ Gemini 2.5 Flash: 5 request/phút, 20 request/ngày mỗi project). Một project thì quá ít để dùng thật. Gateway này giải quyết bốn việc:
 
-1. **Quản lý key**: paste lệnh curl từ AI Studio, hệ thống tự tách API key, gắn nhãn account + project.
+1. **Quản lý key**: paste lệnh curl từ AI Studio, hệ thống tự tách API key, gắn nhãn account + project. Có thể nạp cả loạt key bằng JSON `{ "1": { "name": "…", "key": "…" }, … }` (paste hoặc chọn file ở trang Keys).
 2. **Biết còn bao nhiêu quota**: lưu bảng limit free tier (paste nguyên bảng từ AI Studio) và đếm usage từng key theo từng model.
 3. **Tự chọn key**: request tới model nào thì chọn key còn quota cho model đó, chia đều tải; key bị Google từ chối thì tự chuyển key khác.
 4. **Cấp quyền cho nơi khác dùng**: tạo client key (`sk-gg-…`), chọn model được phép, bên dùng gọi như OpenAI API.

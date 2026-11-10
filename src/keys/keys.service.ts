@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../db/database.service';
 import { maskKey, parseCurl } from './curl-parser';
+import { accountFromProject, parseKeysJson } from './keys-json';
 
 export interface ApiKeyRow {
   id: number;
@@ -98,6 +99,27 @@ export class KeysService {
       .run(account, project, parsed.apiKey, (dto.note || '').trim(), Date.now());
     this.invalidate();
     return { key: this.toPublic(this.get(Number(info.lastInsertRowid))), detectedModel: parsed.model };
+  }
+
+  /**
+   * Nạp cả loạt key từ JSON của script tạo project. Dòng nào lỗi (trùng, thiếu key…) thì bỏ qua
+   * và báo lại, các dòng khác vẫn được lưu.
+   * Account lấy theo thứ tự: trường `account` của dòng -> account nhập trên form -> prefix của tên project.
+   */
+  importJson(dto: { json?: string; account?: string; note?: string }) {
+    const items = parseKeysJson(dto.json || '');
+    if (!items) throw new BadRequestException('JSON không hợp lệ. Cần dạng { "1": { "name": "…", "key": "…" }, … }');
+    const added: ReturnType<KeysService['toPublic']>[] = [];
+    const skipped: { project: string; reason: string }[] = [];
+    for (const it of items) {
+      try {
+        const account = it.account || (dto.account || '').trim() || accountFromProject(it.project);
+        added.push(this.create({ apiKey: it.apiKey, account, project: it.project, note: it.note ?? dto.note }).key);
+      } catch (e: any) {
+        skipped.push({ project: it.project || '(không tên)', reason: e?.message || String(e) });
+      }
+    }
+    return { added, skipped };
   }
 
   update(id: number, dto: { account?: string; project?: string; note?: string; enabled?: boolean }) {

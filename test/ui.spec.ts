@@ -89,3 +89,28 @@ test('URL lạ trả 404; proxy và admin API vẫn nằm đúng chỗ', async (
   assert.equal((await fetch(base + '/api/usage')).status, 200);
   assert.equal((await fetch(base + '/api/clients')).status, 200);
 });
+
+test('import JSON nhiều key: lưu dòng hợp lệ, bỏ qua dòng trùng/thiếu key', async () => {
+  const post = (path: string, body: unknown) =>
+    fetch(base + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const json = JSON.stringify({
+    1: { name: 'imp193-1', key: 'AQ.Ab_IMPORT-1234567890123456' },
+    2: { name: 'imp193-2', key: 'AQ.Ab_IMPORT-2234567890123456' },
+    3: { name: 'imp193-3', key: '' },
+  });
+
+  const preview = await (await post('/api/keys/parse', { curl: json })).json();
+  assert.equal(preview.bulk.length, 3);
+  assert.equal(preview.bulk[0].account, 'imp193');
+  assert.ok(!JSON.stringify(preview).includes('AQ.Ab_IMPORT-1234567890123456'));
+
+  const r = await (await post('/api/keys/import', { json })).json();
+  assert.deepEqual(r.added.map((k: any) => [k.account, k.project]), [['imp193', 'imp193-1'], ['imp193', 'imp193-2']]);
+  assert.deepEqual(r.skipped.map((s: any) => s.project), ['imp193-3']);
+
+  const again = await (await post('/api/keys/import', { json, account: 'other' })).json();
+  assert.equal(again.added.length, 0);
+  assert.equal(again.skipped.length, 3);
+
+  assert.equal((await post('/api/keys/import', { json: 'not json' })).status, 400);
+});

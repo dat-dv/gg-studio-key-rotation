@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { quotaDayEnd, quotaDayStart } from '../src/common/time';
 import { maskKey, parseCurl } from '../src/keys/curl-parser';
+import { accountFromProject, parseKeysJson } from '../src/keys/keys-json';
 import { DEFAULT_LIMITS_RAW } from '../src/limits/default-limits';
 import { normalizeModelId, parseLimitsTable, parseQuotaNumber, unsupportedReason, unusableReason } from '../src/limits/limits-parser';
 import { capabilityMismatch, inferCapability } from '../src/limits/capability';
@@ -116,4 +117,19 @@ test('unsupportedReason: chỉ chặn nhóm Live API / Agents, không quan tâm 
   assert.ok(unsupportedReason(' agents '));
   assert.equal(unsupportedReason('Multi-modal generative models'), null);
   assert.equal(unsupportedReason('Text-out models'), null);
+});
+
+test('parseKeysJson: object đánh số, mảng, và nội dung không phải JSON', () => {
+  const obj = parseKeysJson('{ "1": { "name": "datvan193-1", "key": "AQ.Ab_TEST-1234567890123456" }, "2": { "name": "datvan193-2", "key": "AQ.Ab_TEST-2234567890123456" } }');
+  assert.deepEqual(obj?.map((i) => [i.project, i.apiKey]), [
+    ['datvan193-1', 'AQ.Ab_TEST-1234567890123456'],
+    ['datvan193-2', 'AQ.Ab_TEST-2234567890123456'],
+  ]);
+  const arr = parseKeysJson('[{ "project": "p1", "apiKey": "AQ.Ab_TEST-1234567890123456", "account": "acc" }]');
+  assert.deepEqual(arr, [{ project: 'p1', apiKey: 'AQ.Ab_TEST-1234567890123456', account: 'acc', note: null }]);
+  assert.equal(parseKeysJson("curl 'https://x' -d '{\"a\":1}'"), null);
+  assert.equal(parseKeysJson('{ name: broken }'), null);
+  assert.equal(parseKeysJson('{}'), null);
+  assert.equal(accountFromProject('datvan193-10'), 'datvan193');
+  assert.equal(accountFromProject('solo'), 'solo');
 });

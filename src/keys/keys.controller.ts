@@ -1,6 +1,7 @@
 import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, UseGuards } from '@nestjs/common';
 import { AdminGuard } from '../common/token.guard';
 import { maskKey, parseCurl } from './curl-parser';
+import { accountFromProject, parseKeysJson } from './keys-json';
 import { CreateKeyDto, KeysService } from './keys.service';
 
 @UseGuards(AdminGuard)
@@ -16,6 +17,16 @@ export class KeysController {
   /** Preview: paste curl -> xem key/model trích ra được trước khi lưu. */
   @Post('parse')
   parse(@Body() body: { curl?: string }) {
+    const bulk = parseKeysJson(body?.curl || '');
+    if (bulk)
+      return {
+        found: true,
+        bulk: bulk.map((b) => ({
+          project: b.project,
+          account: b.account || accountFromProject(b.project),
+          keyMasked: b.apiKey ? maskKey(b.apiKey) : null,
+        })),
+      };
     const p = parseCurl(body?.curl || '');
     return { found: !!p.apiKey, keyMasked: p.apiKey ? maskKey(p.apiKey) : null, model: p.model, url: p.url };
   }
@@ -23,6 +34,12 @@ export class KeysController {
   @Post()
   create(@Body() body: CreateKeyDto) {
     return this.keys.create(body || {});
+  }
+
+  /** Nạp nhiều key một lượt từ JSON { "1": { name, key }, … }. */
+  @Post('import')
+  importJson(@Body() body: { json?: string; account?: string; note?: string }) {
+    return this.keys.importJson(body || {});
   }
 
   @Get(':id/reveal')
