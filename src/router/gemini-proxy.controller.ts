@@ -16,6 +16,8 @@ const COUNTED_METHODS = new Set([
   "embedContent",
   "batchEmbedContents",
 ]);
+/** Model gateway tự chọn mà Google trả 404: bỏ qua trong bao lâu trước khi thử lại. */
+const MODEL_NOT_FOUND_COOLDOWN_MS = 3600_000;
 const PATH_RE = /^\/(v1beta|v1|v1alpha)\/models\/([^/:]+):([A-Za-z]+)$/;
 
 function estimateTokens(body: unknown): number {
@@ -577,8 +579,14 @@ export class GeminiProxyController {
             });
             // Gateway tự chọn model mà Google không biết model này (id trong bảng limits chưa đúng) -> thử model kế
             if (autoPicked && up.status === 404) {
+              // 404 là lỗi của model chứ không phải của key: khoá model này trên mọi key 1 giờ để các
+              // request sau bỏ qua luôn, không tốn 1 lượt gọi mỗi request. Sửa model id ở tab Limits
+              // hoặc xoá cooldown ở tab Quota thì thử lại ngay.
+              const until = Date.now() + MODEL_NOT_FOUND_COOLDOWN_MS;
+              for (const k of this.keys.enabledKeys())
+                this.quota.setCooldown(k.id, limit.modelId, until, "404 model not found");
               this.log.warn(
-                `${limit.modelId}: Google trả 404, kiểm tra lại model id ở tab Limits`,
+                `${limit.modelId}: Google trả 404 -> bỏ qua model này tới ${new Date(until).toISOString()}, kiểm tra lại model id ở tab Limits`,
               );
               skipModel = true;
               break;
