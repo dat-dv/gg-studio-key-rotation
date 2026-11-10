@@ -1,4 +1,4 @@
-// Tab "Quota": usage theo model của từng key và cooldown.
+// Trang /quota: usage theo model của từng key và cooldown.
 function meter(used, limit) {
   if (limit === 0) return '<span class="muted">0 / 0</span>';
   const pct = limit == null ? 0 : Math.min(100, (used / limit) * 100);
@@ -52,3 +52,5 @@ function renderQuota() {
 $('#quotaKey').onchange = renderQuota;
 $('#hideZero').onchange = renderQuota;
 async function clearCdModel(keyId, modelId) { await api(`/api/cooldowns/${keyId}/${encodeURIComponent(modelId)}`, { method: 'DELETE' }); refresh(); }
+
+page.onState.push(renderQuota);

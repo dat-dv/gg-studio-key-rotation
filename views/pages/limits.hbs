@@ -1,0 +1,19 @@
+<div class="card">
+  <h2>Import bảng Rate limits từ AI Studio</h2>
+  <textarea id="limitsRaw" rows="6" placeholder="Copy nguyên bảng ở aistudio.google.com → Usage &amp; limits rồi paste vào đây"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button class="btn primary" id="importMerge">Import (merge)</button>
+    <button class="btn danger" id="importReplace">Import (thay toàn bộ)</button>
+    <span class="hint">Nạp mọi model (bỏ phần Tools). Model limit 0 hoặc thuộc nhóm Agents / Live API được đánh dấu "chưa dùng được" và router chặn khi bị gọi. Usage đã ghi không bị xoá.</span>
+  </div>
+  <div id="importPreview" class="tokenbox" style="border-color:var(--border)" hidden></div>
+</div>
+<div class="card">
+  <h2>Bảng limit free tier (áp cho mỗi project)</h2>
+  <p class="hint" style="margin-top:-6px">Model id/alias phải khớp tên model mà client gửi lên (vd <code>gemini-2.5-flash</code>). Router cũng tự khớp các biến thể <code>-preview</code>, <code>-preview-MM-YYYY</code>, <code>-latest</code>, <code>-001</code>.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Tên</th><th>Model id</th><th>Alias (phẩy)</th><th title="Quyết định model gọi qua endpoint nào">Loại</th><th>RPM</th><th>TPM</th><th>RPD</th><th></th></tr></thead>
+    <tbody id="limitsBody"></tbody>
+  </table></div>
+  <div class="row" style="margin-top:10px"><button class="btn" id="addLimit">+ Thêm model</button></div>
+</div>

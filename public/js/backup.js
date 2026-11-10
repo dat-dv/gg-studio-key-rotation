@@ -23,7 +23,7 @@ $('#importFile').onchange = async (ev) => {
     if (!confirm(`Import ${summary} vào server này?`)) return;
     const replace = confirm('Muốn server này Y CHANG file backup?\n\nOK = XOÁ toàn bộ dữ liệu đang có trên server này rồi nạp lại từ file.\nCancel = chỉ gộp thêm, giữ dữ liệu đang có.');
     const r = await api('/api/backup/import' + (replace ? '?mode=replace' : ''), { method: 'POST', body: JSON.stringify(data) });
-    await refresh(); renderLimits(); loadClients();
+    await refresh(); pageReady();
     const skipped = r.keysSkipped.length ? `\n\nBỏ qua ${r.keysSkipped.length} key:\n- ${r.keysSkipped.join('\n- ')}` : '';
     alert(`Import xong (${r.mode === 'replace' ? 'thay toàn bộ' : 'gộp'}): +${r.keysAdded} key mới, ${r.keysUpdated} key cập nhật, ${r.clients} client key, ${r.limits} model, ${r.logs} dòng usage, ${r.cooldowns} cooldown.${skipped}`);
   } catch (e) { toast('Import lỗi: ' + e.message); }

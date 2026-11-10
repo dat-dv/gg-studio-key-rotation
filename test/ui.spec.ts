@@ -28,32 +28,53 @@ after(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('dashboard: render đủ layout, nav và 5 tab', async () => {
-  const res = await fetch(base + '/');
-  assert.equal(res.status, 200);
-  assert.match(res.headers.get('content-type') || '', /text\/html/);
-  const html = await res.text();
-  assert.match(html, /^<!doctype html>/);
-  for (const tab of ['keys', 'clients', 'quota', 'limits', 'logs']) {
-    assert.ok(html.includes(`<section id="tab-${tab}"`), `thiếu section tab-${tab}`);
-    assert.ok(html.includes(`data-tab="${tab}"`), `thiếu nút nav ${tab}`);
-  }
-  assert.equal(html.match(/<button data-tab="[a-z]+" class="active">/g)?.length, 1, 'đúng một tab active lúc đầu');
-  assert.ok(!html.includes('{{'), 'còn sót cú pháp template chưa render');
+const PAGES: Record<string, { marker: string; scripts: string[] }> = {
+  keys: { marker: 'id="keysBody"', scripts: ['core', 'keys', 'backup', 'app'] },
+  clients: { marker: 'id="clientsBody"', scripts: ['core', 'snippet', 'clients', 'backup', 'app'] },
+  quota: { marker: 'id="quotaBody"', scripts: ['core', 'quota', 'backup', 'app'] },
+  limits: { marker: 'id="limitsBody"', scripts: ['core', 'limits', 'backup', 'app'] },
+  logs: { marker: 'id="logsBody"', scripts: ['core', 'logs', 'backup', 'app'] },
+};
+const scriptsOf = (html: string) => [...html.matchAll(/<script src="\/js\/(\w+)\.js\?v=\w+"><\/script>/g)].map((m) => m[1]);
+
+test('trang gốc chuyển hướng về /keys', async () => {
+  const res = await fetch(base + '/', { redirect: 'manual' });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get('location'), '/keys');
 });
 
-test('dashboard: dữ liệu boot là JSON hợp lệ, có đủ loại model', async () => {
-  const html = await (await fetch(base + '/')).text();
+for (const [id, page] of Object.entries(PAGES)) {
+  test(`/${id}: render đúng nội dung, nav và script của trang`, async () => {
+    const res = await fetch(`${base}/${id}`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/html/);
+    const html = await res.text();
+    assert.match(html, /^<!doctype html>/);
+    assert.ok(html.includes(page.marker), `thiếu nội dung trang ${id}`);
+    for (const [other, o] of Object.entries(PAGES)) {
+      assert.ok(html.includes(`<a href="/${other}"`), `thiếu link nav ${other}`);
+      if (other !== id) assert.ok(!html.includes(o.marker), `trang ${id} lẫn nội dung trang ${other}`);
+    }
+    assert.deepEqual(html.match(/<a href="\/\w+" class="active"/g), [`<a href="/${id}" class="active"`]);
+    assert.deepEqual(scriptsOf(html), page.scripts);
+    assert.ok(!html.includes('{{'), 'còn sót cú pháp template chưa render');
+  });
+}
+
+test('dữ liệu boot là JSON hợp lệ, có đủ loại model', async () => {
+  const html = await (await fetch(base + '/limits')).text();
   const boot = JSON.parse(html.match(/<script id="boot" type="application\/json">(.*?)<\/script>/s)![1]);
   assert.deepEqual(Object.keys(boot.capabilities), ['chat', 'embedding', 'tts', 'image', 'other']);
   assert.equal(typeof boot.capabilities.tts.label, 'string');
 });
 
-test('dashboard: mọi css/js trang tham chiếu đều tải được', async () => {
-  const html = await (await fetch(base + '/')).text();
-  const assets = [...html.matchAll(/(?:href|src)="(\/(?:css|js)\/[^"]+)"/g)].map((m) => m[1]);
-  assert.equal(assets.filter((a) => a.startsWith('/js/')).length, 9);
-  assert.equal(assets.filter((a) => a.startsWith('/css/')).length, 1);
+test('mọi css/js các trang tham chiếu đều tải được', async () => {
+  const assets = new Set<string>();
+  for (const id of Object.keys(PAGES)) {
+    const html = await (await fetch(`${base}/${id}`)).text();
+    for (const m of html.matchAll(/(?:href|src)="(\/(?:css|js)\/[^"]+)"/g)) assets.add(m[1]);
+  }
+  assert.equal(assets.size, 10); // app.css + 9 script
   for (const a of assets) {
     const res = await fetch(base + a);
     assert.equal(res.status, 200, a);
@@ -61,7 +82,9 @@ test('dashboard: mọi css/js trang tham chiếu đều tải được', async (
   }
 });
 
-test('proxy và admin API vẫn nằm đúng chỗ bên cạnh trang dashboard', async () => {
+test('URL lạ trả 404; proxy và admin API vẫn nằm đúng chỗ', async () => {
+  assert.equal((await fetch(base + '/khong-co-trang-nay')).status, 404);
   assert.equal((await fetch(base + '/healthz')).status, 200);
   assert.equal((await fetch(base + '/api/usage')).status, 200);
+  assert.equal((await fetch(base + '/api/clients')).status, 200);
 });

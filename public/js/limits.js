@@ -1,4 +1,4 @@
-// Tab "Limits": bảng limit free tier và import bảng Rate limits từ AI Studio.
+// Trang /limits: bảng limit free tier và import bảng Rate limits từ AI Studio.
 function capSelect(l) {
   const opts = Object.entries(CAPS).map(([k, c]) => `<option value="${k}" ${l.capabilityOverride === k ? 'selected' : ''}>${c.label}</option>`).join('');
   return `<select class="cell" data-f="capability"><option value="" ${l.capabilityOverride ? '' : 'selected'}>Tự đoán: ${CAPS[l.capability].label}</option>${opts}</select>
@@ -64,3 +64,5 @@ async function importLimits(mode) {
 }
 $('#importMerge').onclick = () => importLimits('merge');
 $('#importReplace').onclick = () => importLimits('replace');
+
+page.onReady.push(renderLimits); // bảng có ô nhập nên không vẽ lại theo chu kỳ

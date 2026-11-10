@@ -1,0 +1,14 @@
+<div class="stats" id="quotaStats"></div>
+<div class="card">
+  <div class="row" style="margin-bottom:12px">
+    <div style="min-width:280px;flex:1;max-width:420px"><select id="quotaKey"></select></div>
+    <label class="row" style="margin:0;color:var(--text)"><input type="checkbox" id="hideZero" checked style="width:auto" /> Ẩn model chưa dùng được</label>
+    <div class="spacer"></div>
+    <span class="hint" id="resetIn"></span>
+  </div>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Model</th><th>Category</th><th>RPM</th><th>TPM</th><th>RPD</th><th id="availHead">Key còn dùng được</th></tr></thead>
+    <tbody id="quotaBody"></tbody>
+  </table></div>
+  <p class="hint">Số "đã dùng" là số liệu router ghi lại local (cửa sổ trượt 60s cho RPM/TPM, RPD reset 00:00 giờ Pacific). Request gọi thẳng từ AI Studio/app khác bằng cùng project không được đếm — khi đó Google trả 429 và router tự cooldown key.</p>
+</div>

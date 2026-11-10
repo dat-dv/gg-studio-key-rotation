@@ -1,4 +1,4 @@
-// Tab "Client keys": form tạo/sửa key, bảng key, hàng chi tiết (thông tin + xem lại key + lệnh mẫu).
+// Trang /clients: form tạo/sửa key, bảng key, hàng chi tiết (thông tin + xem lại key + lệnh mẫu).
 let clients = [];
 let editingClient = null;
 let openClient = null; // id của key đang mở hàng chi tiết
@@ -159,3 +159,5 @@ function toggleClientDetail(id, scroll = true) {
 
 async function toggleClient(id, enabled) { try { await api(`/api/clients/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); loadClients(); } catch (e) { toast(e.message); } }
 async function delClient(id) { const c = clients.find((x) => x.id === id); if (!confirm(`Xoá key "${c.name}"? Nơi đang dùng key này sẽ bị từ chối ngay.`)) return; await api(`/api/clients/${id}`, { method: 'DELETE' }); loadClients(); }
+
+page.onReady.push(() => { renderClientModels(); loadClients(); });

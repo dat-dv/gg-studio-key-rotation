@@ -1,8 +1,8 @@
 <header>
   <h1>GG Studio · Gemini Key Pool</h1>
   <nav>
-    {{#each tabs}}
-    <button data-tab="{{id}}"{{#if @first}} class="active"{{/if}}>{{label}}</button>
+    {{#each pages}}
+    <a href="/{{id}}"{{#if active}} class="active" aria-current="page"{{/if}}>{{label}}</a>
     {{/each}}
   </nav>
   <div class="spacer"></div>

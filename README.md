@@ -107,15 +107,15 @@ Chỉ chạy **một** replica (bộ đếm quota nằm trong RAM của tiến t
 
 ## Sử dụng
 
-### 1. Thêm key Google (tab **Keys Google**)
+### 1. Thêm key Google (trang **Keys Google**, `/keys`)
 
 Paste lệnh curl lấy từ AI Studio (hoặc chỉ API key), điền account và project. Mỗi project chỉ nhận một key vì quota tính theo project.
 
-### 2. Cập nhật bảng limit (tab **Limits**)
+### 2. Cập nhật bảng limit (trang **Limits**, `/limits`)
 
 Copy nguyên bảng Rate limits trên AI Studio, paste vào ô import. Chỉ những model dùng được qua gateway mới được nạp: bỏ qua model có limit 0, nhóm Agents (cần Interactions API) và Live API (WebSocket). Usage không bị ảnh hưởng. Cột alias dùng để khớp tên model client gửi lên (ví dụ `gemini-flash-latest`).
 
-### 3. Cấp key cho nơi dùng (tab **Client keys**)
+### 3. Cấp key cho nơi dùng (trang **Client keys**, `/clients`)
 
 Nhập tên, chọn **mục đích** (Chat / text, Embedding, TTS, Sinh ảnh...) để tự tick các model thuộc loại đó hoặc tick tay từng model (không tick = mọi model), bấm tạo. Kèm theo là lệnh curl mẫu, chọn được gọi qua **Domain** (từ ngoài vào) hay **Local** (service cùng docker network hoặc cùng máy) và theo chuẩn OpenAI hay Gemini. Địa chỉ mặc định lấy từ `PUBLIC_BASE_URL` / `LOCAL_BASE_URL`, sửa được ngay trên UI; bấm vào **key** ở mỗi dòng để mở thông tin của key (trạng thái, model được phép, lượng dùng hôm nay) kèm lệnh mẫu đúng endpoint cho từng loại model. Trong đó có nút **Hiện** / **Copy key** để xem lại key đầy đủ (key tạo từ bản cũ chỉ có mã băm nên không xem lại được, cần tạo key mới).
 
@@ -183,15 +183,15 @@ src/
   router/    chọn key (quota.service), proxy + failover (gemini-proxy.controller)
   backup/    export / import
   db/        SQLite schema
-  ui/        trang dashboard: UiController render view, cấu hình view engine
-views/       template Handlebars: layout.hbs, index.hbs, partials/ (header + mỗi tab một file)
-public/      file tĩnh: css/app.css, js/ (mỗi tab một file, core.js dùng chung, app.js khởi động)
+  ui/        dashboard: UiController (mỗi trang một URL: /keys /clients /quota /limits /logs), cấu hình view engine
+views/       template Handlebars: layout.hbs, pages/ (mỗi trang một file), partials/header.hbs
+public/      file tĩnh: css/app.css, js/ (mỗi trang một file, core.js dùng chung, app.js khởi động)
 ```
 
 ## Lưu ý
 
 - Số "đã dùng" là số gateway tự đếm. Request gọi thẳng vào project từ AI Studio hay app khác không được đếm; khi đó Google trả 429 và gateway tự cooldown key.
 - RPD reset lúc 00:00 giờ Pacific; RPM/TPM tính theo cửa sổ trượt 60 giây.
-- Limit free tier do Google đặt và có thể đổi bất cứ lúc nào: paste lại bảng ở tab Limits.
+- Limit free tier do Google đặt và có thể đổi bất cứ lúc nào: paste lại bảng ở trang Limits.
 - Điều khoản Google API cấm lách giới hạn sử dụng; gom nhiều account/project để cộng dồn free tier có rủi ro bị khoá key hoặc account.
 - API key Google và client key đều lưu plaintext trong SQLite (client key được xác thực qua mã băm, bản plaintext chỉ để xem lại trên UI): giữ kín file DB, file backup và `ADMIN_TOKEN`.

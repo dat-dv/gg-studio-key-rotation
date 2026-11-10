@@ -8,7 +8,18 @@ const BOOT = JSON.parse($('#boot').textContent);
 /** Loại model -> nhãn và cách gọi; nguồn duy nhất là CAPABILITY_UI ở src/limits/capability.ts. */
 const CAPS = BOOT.capabilities;
 let state = { keys: [], limits: [], usage: {}, cooldowns: [], now: Date.now(), dayEnd: 0 };
-let currentTab = 'keys';
+/**
+ * Mỗi URL là một trang riêng, chỉ nạp script của trang đó. Script của trang đăng ký vào đây
+ * để core gọi lại mà không cần biết trang nào đang mở.
+ */
+const page = {
+  /** Vẽ lại mỗi khi state mới về (5s một lần). Chỉ dùng cho phần không có ô đang nhập dở. */
+  onState: [],
+  /** Chạy một lần khi có state đầu tiên, và chạy lại sau khi import backup. */
+  onReady: [],
+};
+let pageStarted = false;
+function pageReady() { page.onReady.forEach((f) => f()); }
 
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 2600); }
 
@@ -27,7 +38,11 @@ async function api(path, opts = {}) {
 
 // ---------- data ----------
 async function refresh() {
-  try { state = await api('/api/usage'); render(); } catch (e) { toast(e.message); }
+  try {
+    state = await api('/api/usage');
+    render();
+    if (!pageStarted) { pageStarted = true; pageReady(); }
+  } catch (e) { toast(e.message); }
 }
 
 function cooldownsFor(keyId) { return state.cooldowns.filter((c) => c.keyId === keyId); }
@@ -41,12 +56,12 @@ function keyAvailable(k, l) {
 
 function render() {
   renderClock();
-  if (currentTab === 'keys') renderKeys();
-  if (currentTab === 'quota') renderQuota();
+  page.onState.forEach((f) => f());
 }
 
 function renderClock() {
   const left = state.dayEnd - Date.now();
   $('#clock').textContent = state.dayEnd ? `RPD reset sau ${dur(left)} (00:00 PT)` : '';
-  $('#resetIn').textContent = $('#clock').textContent;
+  const resetIn = $('#resetIn'); // chỉ có ở trang Quota
+  if (resetIn) resetIn.textContent = $('#clock').textContent;
 }

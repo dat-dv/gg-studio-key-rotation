@@ -1,4 +1,4 @@
-// Tab "Keys Google": danh sách key, thêm key từ lệnh curl, hiện/copy/test/sửa/xoá.
+// Trang /keys: danh sách key, thêm key từ lệnh curl, hiện/copy/test/sửa/xoá.
 function renderKeys() {
   const accounts = [...new Set(state.keys.map((k) => k.account))];
   $('#accountList').innerHTML = accounts.map((a) => `<option value="${esc(a)}">`).join('');
@@ -80,3 +80,5 @@ async function editKey(id) {
   const note = prompt('Ghi chú', k.note); if (note == null) return;
   try { await api(`/api/keys/${id}`, { method: 'PATCH', body: JSON.stringify({ account, project, note }) }); refresh(); } catch (e) { toast(e.message); }
 }
+
+page.onState.push(renderKeys);

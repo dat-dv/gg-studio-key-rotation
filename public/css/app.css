@@ -15,12 +15,12 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 sys
 header { display: flex; align-items: center; gap: 24px; padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
 header h1 { font-size: 16px; margin: 0; font-weight: 650; }
 nav { display: flex; gap: 4px; }
-nav button { background: none; border: 0; padding: 7px 12px; border-radius: 6px; color: var(--muted); cursor: pointer; font: inherit; }
-nav button.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+nav a { padding: 7px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--text); }
+nav a.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
 .spacer { flex: 1; }
 #clock { color: var(--muted); font-size: 12px; }
 main { padding: 20px 24px 60px; max-width: 1280px; margin: 0 auto; }
-section { display: none; } section.active { display: block; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
 .card h2 { font-size: 14px; margin: 0 0 12px; }
 .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
