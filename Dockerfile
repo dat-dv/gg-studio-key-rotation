@@ -1,19 +1,27 @@
-# ---- build ----
-FROM node:20-bookworm-slim AS build
-# better-sqlite3 không phải lúc nào cũng có prebuilt cho node/arch này -> cần toolchain để tự build
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+# syntax=docker/dockerfile:1
+
+# Node 24 LTS: better-sqlite3 có sẵn binary prebuilt cho cả amd64 lẫn arm64,
+# nên KHÔNG cần cài python/make/g++ (bước từng tốn ~6 phút trên server).
+FROM node:24-bookworm-slim AS base
 WORKDIR /app
+
+# ---- dependency chạy production (chạy song song với stage build) ----
+FROM base AS deps
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --no-audit --no-fund
+
+# ---- build TypeScript ----
+FROM base AS build
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY tsconfig.json nest-cli.json ./
 COPY src ./src
-RUN npm run build && npm prune --omit=dev
+RUN npm run build
 
 # ---- runtime ----
-FROM node:20-bookworm-slim
+FROM base
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000 DB_PATH=/app/data/gg-studio.db
-WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
+COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY public ./public
