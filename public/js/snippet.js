@@ -8,6 +8,8 @@ function baseFor(mode) {
   if (saved) return saved;
   return mode === 'domain' ? (gwConfig.publicBaseUrl || location.origin) : (gwConfig.localBaseUrl || 'http://gg-studio:3000');
 }
+/** Base URL gốc của gateway: bỏ `/` cuối và đuôi `/v1` / `/v1beta` (người dùng hay dán luôn base của OpenAI SDK), vì lệnh mẫu tự nối path. */
+const normBase = (v) => String(v || '').trim().replace(/\/+$/, '').replace(/\/v1(beta)?$/i, '').replace(/\/+$/, '');
 const capOf = (modelId) => state.limits.find((l) => l.modelId === modelId)?.capability || 'chat';
 /** Lệnh curl đúng endpoint cho loại model (chat / embedding / tts / image / other). */
 function curlText(base, key, model, fmt, cap) {
@@ -54,7 +56,7 @@ function renderSnippet(box, sn, onClose) {
   const curMode = () => box.querySelector(`input[name=${radio}]:checked`).value;
   let fmtChoice = 'openai';
   const update = () => {
-    const base = q('base').value.trim().replace(/\/+$/, '');
+    const base = normBase(q('base').value);
     const model = q('model').value;
     const cap = capOf(model);
     const nativeOnly = cap !== 'chat' && cap !== 'embedding';
