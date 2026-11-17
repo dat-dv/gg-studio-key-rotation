@@ -20,6 +20,7 @@ const KEYS = 12;
 let app: NestExpressApplication;
 let upstream: Server;
 let base: string;
+let upstreamHits = 0;
 
 const json = (path: string, method: string, body?: unknown) =>
   fetch(base + path, {
@@ -33,6 +34,7 @@ type Usage = { keys: { id: number }[]; usage: Record<string, Record<string, { rp
 
 before(async () => {
   upstream = createServer((req, res) => {
+    upstreamHits++;
     req.resume();
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ candidates: [], usageMetadata: { totalTokenCount: 7 } }));
@@ -59,18 +61,28 @@ after(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('ít request trên nhiều model: rải ra cả pool, không dồn vào mấy key đầu', async () => {
-  // 3 model x 4 request = 12 request trên 12 key. Con trỏ xoay vòng riêng từng model thì model nào cũng bắt đầu
-  // từ key đầu: 4 key đầu nhận 3 request, 8 key (2 account) còn lại không được gọi lần nào.
-  for (let i = 0; i < 4; i++) for (const m of MODELS) assert.equal((await call(m)).status, 200);
+const totals = async () => {
   const u = (await (await json('/api/usage', 'GET')).json()) as Usage;
-  const totals = u.keys.map((k) => Object.values(u.usage[k.id] || {}).reduce((s, x) => s + x.rpd, 0));
-  assert.deepEqual(totals, Array(KEYS).fill(1), 'mỗi key đúng 1 request');
+  return u.keys.map((k) => Object.values(u.usage[k.id] || {}).reduce((s, x) => s + x.rpd, 0));
+};
+
+test('ít request trên nhiều model: chọn ngẫu nhiên nên rải ra cả pool, không dồn vào mấy key đầu', async () => {
+  // 2 model (RPM 15) x 60 request trên 12 key, trung bình 10 request/key.
+  // Xác suất một key không được gọi lần nào ~ (11/12)^120, coi như không xảy ra.
+  for (let i = 0; i < 60; i++)
+    for (const m of ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']) assert.equal((await call(m)).status, 200);
+  const t = await totals();
+  assert.equal(t.reduce((a, b) => a + b, 0), 120);
+  assert.ok(t.every((x) => x > 0), `key nào cũng được gọi: ${t}`);
 });
 
-test('vẫn ưu tiên key ít dùng nhất của TỪNG model', async () => {
-  // thêm 8 request cho 1 model: 4 key đã chạy model này (1 lần) phải đợi 8 key chưa chạy
-  for (let i = 0; i < 8; i++) assert.equal((await call(MODELS[0])).status, 200);
+test('không bao giờ chọn key hết lượt: dùng hết đúng tổng số lượt của pool rồi mới báo hết', async () => {
+  // gemini-3.8-flash: RPM 5 x 12 key = 60 lượt/phút. Chọn nhầm key đã hết thì Google sẽ bị gọi thừa / request bị 429 sớm.
+  const MODEL = MODELS[0];
+  for (let i = 0; i < 5 * KEYS; i++) assert.equal((await call(MODEL)).status, 200, `request ${i + 1}`);
   const u = (await (await json('/api/usage', 'GET')).json()) as Usage;
-  for (const k of u.keys) assert.equal(u.usage[k.id][MODELS[0]].rpd, 1, `key #${k.id}`);
+  for (const k of u.keys) assert.equal(u.usage[k.id][MODEL].rpd, 5, `key #${k.id}`);
+  const hits = upstreamHits;
+  assert.equal((await call(MODEL)).status, 429, 'cả pool hết lượt -> trả luôn');
+  assert.equal(upstreamHits, hits, 'không gọi Google khi hết lượt');
 });

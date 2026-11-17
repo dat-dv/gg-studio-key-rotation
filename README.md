@@ -50,7 +50,7 @@ flowchart LR
 ### Đường đi của một request
 
 1. **Xác thực**: so mã băm của client key với cache trong RAM, kiểm tra model có nằm trong danh sách được phép.
-2. **Chọn key** (một lượt gọi Redis, không có lệnh SQL): script Lua bỏ key đang cooldown hoặc đã chạm RPM/TPM/RPD, lấy key **đã dùng ít nhất** cho model đó (hoà thì xoay vòng, con trỏ xoay vòng dùng chung cho mọi model nên ít request trên nhiều model vẫn rải ra cả pool) và **cộng bộ đếm ngay** trong cùng script, nên request tới sau luôn thấy số của request tới trước.
+2. **Chọn key** (một lượt gọi Redis, không có lệnh SQL): script Lua bỏ key đang cooldown hoặc đã chạm RPM/TPM/RPD, chọn **ngẫu nhiên** một key trong số còn lượt cho model đó và **cộng bộ đếm ngay** trong cùng script, nên request tới sau luôn thấy số của request tới trước.
 3. **Gọi Google** bằng key vừa chọn.
 4. **Xử lý kết quả**:
 
@@ -69,7 +69,7 @@ Thử tối đa `MAX_ATTEMPTS` key cho một request. Hết key thì trả 429 k
 
 ### Redis giữ trạng thái quota, SQLite giữ log
 
-- **Redis** (bắt buộc) giữ mọi thứ quyết định việc chọn key: bộ đếm RPM/TPM/RPD theo từng cặp key + model, hạn mức ngày của client key, cooldown, con trỏ xoay vòng. Tiến trình Node không giữ bộ đếm nào trong RAM; key trong Redis tự hết hạn (cửa sổ phút sau 2 phút, bộ đếm ngày sau khi sang ngày).
+- **Redis** (bắt buộc) giữ mọi thứ quyết định việc chọn key: bộ đếm RPM/TPM/RPD theo từng cặp key + model, hạn mức ngày của client key, cooldown. Tiến trình Node không giữ bộ đếm nào trong RAM; key trong Redis tự hết hạn (cửa sổ phút sau 2 phút, bộ đếm ngày sau khi sang ngày).
 - Kiểm tra quota và cộng bộ đếm nằm trong **một script Lua** nên là nguyên tử: 30 request tới cùng lúc không thể cùng lấy slot cuối.
 - **SQLite** chỉ lưu cấu hình (key, limits, client key) và log request cho trang Logs / thống kê. Log được ghi theo lô mỗi 200ms, không nằm trên đường chọn key.
 - Redis trống (lần đầu chạy bản này, hoặc Redis mất dữ liệu) thì lúc khởi động gateway dựng lại bộ đếm hôm nay từ log trong SQLite.

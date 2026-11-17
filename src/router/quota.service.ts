@@ -68,8 +68,6 @@ export type ReserveResult =
  *   cd:<keyId>                   HASH modelId|"*" -> "<until>|<reason>"
  *   strike:<pair>                số lần liên tiếp Google trả 429 cho pair (về 0 khi có request thành công)
  *   probe:<pair>                 logId của request đang đi thử dò cho pair vừa bị 429 (TTL 60s)
- *   rr                           con trỏ xoay vòng, CHUNG cho mọi model: mỗi model chỉ vài request thì vẫn rải ra cả pool
- *                                (con trỏ riêng từng model thì model nào cũng bắt đầu từ key đầu, key cuối không bao giờ tới lượt)
  *   inf:<keyId>                  ZSET logId -> ts, request đang chạy trên key  (dọn mục quá 15 phút)
  *   ovl:<modelId>                ZSET keyId -> ts, key vừa bị Google từ chối vì quá tải (429 không rõ quota / 503)
  *   pause:<modelId>              thời điểm hết tạm nghỉ model vì Google đang quá tải
@@ -78,8 +76,8 @@ export type ReserveResult =
  */
 
 /**
- * Giữ chỗ nguyên tử: kiểm tra hạn mức client, duyệt key theo vòng xoay, bỏ key đang cooldown / hết RPD / RPM / TPM,
- * chọn key ĐÃ DÙNG ÍT NHẤT rồi cộng bộ đếm ngay. Pair vừa bị 429 (còn strike) mà đã hết cooldown thì chỉ cho MỘT
+ * Giữ chỗ nguyên tử: kiểm tra hạn mức client, duyệt mọi key, bỏ key đang cooldown / hết RPD / RPM / TPM,
+ * chọn NGẪU NHIÊN một key trong số còn lượt rồi cộng bộ đếm ngay. Pair vừa bị 429 (còn strike) mà đã hết cooldown thì chỉ cho MỘT
  * request đi thử dò; các request khác bỏ qua pair đó cho tới khi request dò có kết quả. Cả đoạn chạy trong 1 script nên request (kể cả từ instance khác)
  * tới sau luôn thấy số của request tới trước.
  * Model đang tạm nghỉ vì Google quá tải -> trả 'paused', không gọi key nào. Key đã có đủ maxInflight request đang
@@ -87,7 +85,8 @@ export type ReserveResult =
  * Model đang bị khoá vì Google trả 404 (gone:) -> trả 'blocked' khi honorBlock = 1 (gateway tự chọn model); client
  * gọi đích danh model thì vẫn cho đi để nhận nguyên lỗi của Google.
  * ARGV: prefix, now, dayStart, dayEnd, model, estTokens, logId, rpm, tpm, rpd, clientId, clientLimit, maxInflight,
- *       honorBlock, rồi (keyId, excluded)*
+ *       honorBlock, rand (số nguyên ngẫu nhiên do Node sinh: math.random trong script Redis không đủ ngẫu nhiên),
+ *       rồi (keyId, excluded)*
  */
 const LUA_RESERVE = `
 local P = ARGV[1]
@@ -101,7 +100,8 @@ local rpm, tpm, rpd = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
 local clientId = ARGV[11]
 local clientLimit = tonumber(ARGV[12])
 local maxInf = tonumber(ARGV[13]) or 0
-local BASE = 14
+local rand = tonumber(ARGV[15]) or 0
+local BASE = 15
 local n = (#ARGV - BASE) / 2
 local dayTtl = math.floor(dayEnd / 1000) + 3600
 local cut = '(' .. string.format('%d', now - 60000)
@@ -131,14 +131,13 @@ local function busy(keyId)
   return redis.call('ZCARD', ik) >= maxInf
 end
 
-local start = tonumber(redis.call('GET', P .. 'rr') or '0') % n
 local retryAt = -1
 local function retry(t) if retryAt < 0 or t < retryAt then retryAt = t end end
 local detail = {}
-local bestIdx, bestRpd, bestRpm, bestProbing = -1, 0, 0, false
+-- cac key con luot: {idx, dang thu do}
+local avail = {}
 
-for i = 0, n - 1 do
-  local idx = (start + i) % n
+for idx = 0, n - 1 do
   local keyId = ARGV[BASE + 1 + idx * 2]
   if ARGV[BASE + 2 + idx * 2] ~= '1' then
     local pair = keyId .. '|' .. model
@@ -191,14 +190,16 @@ for i = 0, n - 1 do
         -- request lon hon ca TPM van duoc thu khi phut nay chua dung gi (de Google quyet dinh)
         retry(oldest + 60000)
         detail[#detail + 1] = {idx, 'tpm', tostring(uTpm)}
-      elseif bestIdx < 0 or uRpd < bestRpd or (uRpd == bestRpd and uRpm < bestRpm) then
-        bestIdx, bestRpd, bestRpm, bestProbing = idx, uRpd, uRpm, probing
+      else
+        avail[#avail + 1] = {idx, probing}
       end
     end
   end
 end
 
-if bestIdx < 0 then return {0, 'exhausted', string.format('%d', retryAt), detail} end
+if #avail == 0 then return {0, 'exhausted', string.format('%d', retryAt), detail} end
+local pick = avail[(rand % #avail) + 1]
+local bestIdx, bestProbing = pick[1], pick[2]
 
 local keyId = ARGV[BASE + 1 + bestIdx * 2]
 local pair = keyId .. '|' .. model
@@ -217,7 +218,6 @@ if clientId ~= '' then
   clientUsed = redis.call('INCR', ck)
   redis.call('EXPIREAT', ck, dayTtl)
 end
-redis.call('SET', P .. 'rr', bestIdx + 1, 'EX', 172800)
 if maxInf > 0 then
   redis.call('ZADD', P .. 'inf:' .. keyId, now, logId)
   redis.call('PEXPIRE', P .. 'inf:' .. keyId, 900000)
@@ -415,7 +415,7 @@ type Scripts = {
 
 /**
  * Trạng thái quota nằm hết ở Redis, không giữ trong RAM của process và không có lệnh SQL nào trên đường đi của request:
- *  - bộ đếm RPM/TPM/RPD, hạn mức client, cooldown, con trỏ xoay vòng: Redis, đọc + cộng trong 1 script Lua (nguyên tử)
+ *  - bộ đếm RPM/TPM/RPD, hạn mức client, cooldown: Redis, đọc + cộng trong 1 script Lua (nguyên tử)
  *  - danh sách key đang bật: cache trong KeysService
  *  - log request: hàng đợi nhỏ, ghi xuống SQLite theo lô mỗi 200ms (write-behind) để trang Logs / thống kê đọc
  * RAM của process chỉ còn các request ĐANG chạy (logId -> dòng log) và hàng đợi log chưa ghi.
@@ -601,7 +601,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   async resetCounters(wipeCooldowns = false, keepInflight = false) {
     this.flush();
     if (!keepInflight) this.inflight.clear();
-    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*'] : [])];
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
       for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));
@@ -783,7 +783,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   // ---------------------------------------------------------------- chọn key
 
   /**
-   * Chọn key chia đều (ít dùng nhất, hoà thì xoay vòng), chỉ xét key còn quota, và giữ chỗ luôn.
+   * Chọn ngẫu nhiên một key trong số còn quota và giữ chỗ luôn; không còn key nào thì báo hết, không gọi Google.
    * Việc kiểm tra + cộng bộ đếm chạy trong 1 script Lua trên Redis nên 2 request đồng thời
    * (kể cả ở 2 instance) không thể cùng lấy 1 slot cuối. Redis lỗi -> ném ra, router trả 503.
    */
@@ -820,6 +820,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
       num(clientLimit),
       this.maxInflightPerKey,
       honorBlock ? 1 : 0,
+      Math.floor(Math.random() * 0x7fffffff),
       ...keys.flatMap((k) => [k.id, exclude.has(k.id) ? 1 : 0]),
     );
 
