@@ -68,7 +68,8 @@ export type ReserveResult =
  *   cd:<keyId>                   HASH modelId|"*" -> "<until>|<reason>"
  *   strike:<pair>                số lần liên tiếp Google trả 429 cho pair (về 0 khi có request thành công)
  *   probe:<pair>                 logId của request đang đi thử dò cho pair vừa bị 429 (TTL 60s)
- *   rr:<modelId>                 con trỏ xoay vòng
+ *   rr                           con trỏ xoay vòng, CHUNG cho mọi model: mỗi model chỉ vài request thì vẫn rải ra cả pool
+ *                                (con trỏ riêng từng model thì model nào cũng bắt đầu từ key đầu, key cuối không bao giờ tới lượt)
  *   inf:<keyId>                  ZSET logId -> ts, request đang chạy trên key  (dọn mục quá 15 phút)
  *   ovl:<modelId>                ZSET keyId -> ts, key vừa bị Google từ chối vì quá tải (429 không rõ quota / 503)
  *   pause:<modelId>              thời điểm hết tạm nghỉ model vì Google đang quá tải
@@ -130,7 +131,7 @@ local function busy(keyId)
   return redis.call('ZCARD', ik) >= maxInf
 end
 
-local start = tonumber(redis.call('GET', P .. 'rr:' .. model) or '0') % n
+local start = tonumber(redis.call('GET', P .. 'rr') or '0') % n
 local retryAt = -1
 local function retry(t) if retryAt < 0 or t < retryAt then retryAt = t end end
 local detail = {}
@@ -216,7 +217,7 @@ if clientId ~= '' then
   clientUsed = redis.call('INCR', ck)
   redis.call('EXPIREAT', ck, dayTtl)
 end
-redis.call('SET', P .. 'rr:' .. model, bestIdx + 1, 'EX', 172800)
+redis.call('SET', P .. 'rr', bestIdx + 1, 'EX', 172800)
 if maxInf > 0 then
   redis.call('ZADD', P .. 'inf:' .. keyId, now, logId)
   redis.call('PEXPIRE', P .. 'inf:' .. keyId, 900000)
@@ -600,7 +601,7 @@ export class QuotaService implements OnModuleInit, OnModuleDestroy, BeforeApplic
   async resetCounters(wipeCooldowns = false, keepInflight = false) {
     this.flush();
     if (!keepInflight) this.inflight.clear();
-    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*'] : [])];
+    const patterns = ['rpd:*', 'win:*', 'tok:*', 'client:*', 'pairs:*', 'rr', 'rr:*', 'inf:*', ...(wipeCooldowns ? ['cd:*', 'strike:*', 'probe:*', 'ovl:*', 'pause:*', 'gone:*'] : [])];
     for (const p of patterns) {
       const keys = await this.redis.scan(p);
       for (let i = 0; i < keys.length; i += 500) await this.r.del(...keys.slice(i, i + 500));

@@ -50,7 +50,7 @@ flowchart LR
 ### Đường đi của một request
 
 1. **Xác thực**: so mã băm của client key với cache trong RAM, kiểm tra model có nằm trong danh sách được phép.
-2. **Chọn key** (một lượt gọi Redis, không có lệnh SQL): script Lua bỏ key đang cooldown hoặc đã chạm RPM/TPM/RPD, lấy key **đã dùng ít nhất** cho model đó (hoà thì xoay vòng) và **cộng bộ đếm ngay** trong cùng script, nên request tới sau luôn thấy số của request tới trước.
+2. **Chọn key** (một lượt gọi Redis, không có lệnh SQL): script Lua bỏ key đang cooldown hoặc đã chạm RPM/TPM/RPD, lấy key **đã dùng ít nhất** cho model đó (hoà thì xoay vòng, con trỏ xoay vòng dùng chung cho mọi model nên ít request trên nhiều model vẫn rải ra cả pool) và **cộng bộ đếm ngay** trong cùng script, nên request tới sau luôn thấy số của request tới trước.
 3. **Gọi Google** bằng key vừa chọn.
 4. **Xử lý kết quả**:
 
