@@ -20,6 +20,8 @@ const COUNTED_METHODS = new Set([
 const MODEL_NOT_FOUND_COOLDOWN_MS = 3600_000;
 /** Google trả 429 liên tiếp cho một cặp key+model: thời gian khoá tăng gấp đôi mỗi lần, tối đa chừng này. */
 const RATE_LIMIT_BACKOFF_CAP_MS = 3600_000;
+/** 429 hạn mức theo vùng của project: lần đầu khoá cả key chừng này, các lần sau gấp đôi (tối đa RATE_LIMIT_BACKOFF_CAP_MS). */
+const REGIONAL_LIMIT_BASE_MS = 5 * 60_000;
 const PATH_RE = /^\/(v1beta|v1|v1alpha)\/models\/([^/:]+):([A-Za-z]+)$/;
 
 function estimateTokens(body: unknown): number {
@@ -720,10 +722,21 @@ export class GeminiProxyController {
             let why = `429 ${ce.quotaIds[0] || "RESOURCE_EXHAUSTED"}`;
             let until: number;
             // 429 không nói quota nào: có thể là Google quá tải model chứ không phải key hết quota
-            const ovl = ce.quotaIds.length
+            // (hạn mức theo vùng của project thì không phải: xử lý riêng bên dưới, không tính vào quá tải model)
+            const ovl = ce.quotaIds.length || ce.regional
               ? null
               : await this.quota.overload(key.id, limit.modelId);
-            if (perDay) {
+            if (ce.regional) {
+              // Project không có (hoặc đã hết) hạn mức theo vùng: model nào trên key này cũng bị, nên khoá CẢ KEY
+              // ('*') lâu dần, tối đa 1 giờ. Không đụng tới model: các key khác vẫn chạy bình thường.
+              why = "429 hạn mức theo vùng của project";
+              const base = Math.max(ce.retryDelayMs ?? 0, REGIONAL_LIMIT_BASE_MS);
+              const b = await this.quota.backoff(key.id, "*", base, Math.max(base, RATE_LIMIT_BACKOFF_CAP_MS), why);
+              until = b.until;
+              if (b.strikes > 1) why += ` (lần ${b.strikes} liên tiếp)`;
+              // key hỏng không tính vào số lượt thử của request: còn key khác thì thử tiếp (vẫn bị chặn bởi deadline)
+              tries--;
+            } else if (perDay) {
               until = quotaDayEnd();
               await this.quota.setCooldown(key.id, limit.modelId, until, why);
             } else if (ovl?.paused) {

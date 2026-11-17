@@ -61,6 +61,7 @@ flowchart LR
 | 429 khác (quota theo phút, hoặc Google không nói rõ) | Khoá theo `retryDelay` (mặc định 60s), thử key khác. Cặp key + model bị 429 liên tiếp thì mỗi lần khoá gấp đôi, tối đa 1 giờ. Hết khoá thì chỉ **một** request được đi thử dò, các request khác bỏ qua cặp đó; thử thành công mới mở lại bình thường |
 | Key không hợp lệ / project bị khoá | Tắt hẳn key, thử key khác |
 | 403 khác | Khoá cặp key + model 1 giờ, thử key khác |
+| 429 "limit per minute for a region" | Hạn mức theo vùng của project (project không có free tier thì bị ngay từ request đầu, mọi model). Khoá **cả key** 5 phút, mỗi lần bị lại gấp đôi (tối đa 1 giờ); không tính là quá tải model và không tính vào số lượt thử của request |
 | 429 không rõ quota hoặc 503 "high demand" trên nhiều key | Google đang quá tải model, không phải key hết quota. Đủ `OVERLOAD_THRESHOLD` key khác nhau bị trong 10s thì tạm nghỉ cả model `OVERLOAD_PAUSE_MS`, không khoá key, trả 503 kèm `Retry-After`. Một request gặp quá tải 2 lần ở một model thì sang model kế |
 | 5xx, lỗi mạng | Không phạt key, thử key khác |
 | 400 / 404 | Trả nguyên lỗi cho client, không thử lại |

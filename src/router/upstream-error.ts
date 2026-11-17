@@ -6,6 +6,11 @@ export interface ClassifiedError {
   reason: string | null;
   quotaIds: string[];
   retryDelayMs: number | null;
+  /**
+   * 429 vì hạn mức phút THEO VÙNG của project ("... limit per minute for a region"). Project bị vậy thì model nào
+   * cũng bị, kể cả khi chưa gọi lần nào: lỗi của key/project, không phải Google quá tải model.
+   */
+  regional: boolean;
 }
 
 /** Các reason nghĩa là KEY/PROJECT hỏng -> tắt key luôn. */
@@ -61,7 +66,9 @@ export function classifyUpstreamError(status: number, bodyText: string): Classif
   else if (status === 0 || status === 408 || status >= 500) kind = 'transient';
   else kind = 'client';
 
-  return { kind, message, reason, quotaIds, retryDelayMs };
+  const regional = kind === 'rate_limit' && /limit '[^']*for a region'/i.test(message);
+
+  return { kind, message, reason, quotaIds, retryDelayMs, regional };
 }
 
 export function googleError(code: number, status: string, message: string, extra: Record<string, unknown> = {}) {
